@@ -1,0 +1,93 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: screenwriter-db
+    environment:
+      POSTGRES_USER: ${DB_USER:-screenwriter}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-screenwriter}
+      POSTGRES_DB: ${DB_NAME:-screenwriter}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./server/db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-screenwriter}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - screenwriter-network
+
+  backend:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: screenwriter-backend
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: 3001
+      DATABASE_URL: postgresql://${DB_USER:-screenwriter}:${DB_PASSWORD:-screenwriter}@postgres:5432/${DB_NAME:-screenwriter}
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-screenwriter}
+      DB_USER: ${DB_USER:-screenwriter}
+      DB_PASSWORD: ${DB_PASSWORD:-screenwriter}
+    ports:
+      - "3001:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - screenwriter-network
+    volumes:
+      - ./server:/app
+      - /app/node_modules
+    # Note: Backend only handles database operations (/api/projects, /api/writing)
+    # AI endpoints are handled by ai-service (Python)
+
+  ai-service:
+    build:
+      context: ./server-python
+      dockerfile: Dockerfile
+    container_name: screenwriter-ai
+    environment:
+      PORT: 3002
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DATABASE_URL: postgresql://${DB_USER:-screenwriter}:${DB_PASSWORD:-screenwriter}@postgres:5432/${DB_NAME:-screenwriter}
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-screenwriter}
+      DB_USER: ${DB_USER:-screenwriter}
+      DB_PASSWORD: ${DB_PASSWORD:-screenwriter}
+    ports:
+      - "3002:3002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - screenwriter-network
+    volumes:
+      - ./server-python:/app
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: screenwriter-frontend
+    environment:
+      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://backend:3001/api}
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+    networks:
+      - screenwriter-network
+
+volumes:
+  postgres_data:
+
+networks:
+  screenwriter-network:
+    driver: bridge
+
