@@ -119,7 +119,8 @@ export async function* streamChat(
     contextElementIds?: string[];
   }
 ): AsyncGenerator<string> {
-  const streamEvents = (mode || 'ask') === 'edit';
+  // Typed streaming events are now the default for both ask + edit (Cursor-like).
+  const streamEvents = true;
   const response = await fetch(`${API_BASE}/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

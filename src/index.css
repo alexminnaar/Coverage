@@ -7616,7 +7616,7 @@ body,
   display: flex;
   align-items: baseline;
   gap: 6px;
-  padding: 8px 14px;
+  padding: 6px 14px;
   background: var(--badge-bg-green);
   border: 1px solid var(--badge-border-green);
   border-radius: 20px;
@@ -7637,16 +7637,31 @@ body,
   border-color: rgba(46, 204, 113, 0.5);
 }
 
-.goal-text {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-secondary);
-  line-height: 1.2;
+.writing-goals-badge .goal-number {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0;
+  font-size: 15px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
 }
 
-.goal-text strong {
+.writing-goals-badge .goal-current {
   color: #2ecc71;
+}
+
+.writing-goals-badge .goal-sep,
+.writing-goals-badge .goal-target {
+  color: var(--text-muted);
   font-weight: 700;
+}
+
+.writing-goals-badge .goal-label {
+  font-size: 10px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  font-weight: 600;
 }
 
 /* Writing Goals Modal */

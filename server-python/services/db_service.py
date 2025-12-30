@@ -212,4 +212,64 @@ class DBService:
             logger.error(f"[DB Verify] ❌ Error verifying element IDs: {type(e).__name__}: {e}")
             return {eid: True for eid in element_ids}
 
+    async def fetch_project_elements_with_index(
+        self,
+        project_id: str,
+        *,
+        element_types: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, object]]:
+        """Fetch screenplay elements from the `projects` JSONB with stable ordering.
+
+        Returns a list of dicts:
+        - element_id (str)
+        - element_type (str)
+        - element_index (int) 0-based
+        - content (str)
+        """
+        await self.ensure_pool()
+        if not self.pool:
+            return []
+
+        try:
+            query = """
+                WITH indexed_elements AS (
+                    SELECT 
+                        elem,
+                        elem->>'id' AS element_id,
+                        elem->>'type' AS element_type,
+                        (ordinality - 1)::int AS element_index,
+                        elem->>'content' AS content
+                    FROM projects p,
+                         LATERAL jsonb_array_elements(p.data->'elements') WITH ORDINALITY t(elem, ordinality)
+                    WHERE p.id = $1::uuid
+                )
+                SELECT element_id, element_type, element_index, content
+                FROM indexed_elements
+            """
+            params: list[object] = [project_id]
+
+            if element_types:
+                query += " WHERE element_type = ANY($2::text[])"
+                params.append(element_types)
+
+            query += " ORDER BY element_index"
+            if limit is not None:
+                query += " LIMIT $%d" % (len(params) + 1)
+                params.append(int(limit))
+
+            rows = await self.pool.fetch(query, *params)
+            return [
+                {
+                    "element_id": row["element_id"],
+                    "element_type": row["element_type"],
+                    "element_index": row["element_index"],
+                    "content": row["content"] or "",
+                }
+                for row in rows
+            ]
+        except Exception as e:
+            logger.error(f"[DB Elements] ❌ Error fetching project elements: {type(e).__name__}: {e}")
+            return []
+
 

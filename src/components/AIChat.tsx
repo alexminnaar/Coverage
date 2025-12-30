@@ -469,7 +469,7 @@ export default function AIChat({
 
     let sceneCount = 0;
     const formatted = windowEls
-      .map((el, idx) => {
+        .map((el, idx) => {
         const absoluteIdx = startIdx + idx;
         if (el.type === 'scene-heading') sceneCount++;
         const prefix = mode === 'edit' ? `Element ${absoluteIdx + 1} (ID: ${el.id}, Type: ${el.type}):` : '';
@@ -656,15 +656,18 @@ export default function AIChat({
           const hasEdits = msg.edits && msg.edits.length > 0;
           const isLastMessage = i === messages.length - 1;
           const isStreamingEdit = isStreaming && isLastMessage && mode === 'edit' && msg.role === 'assistant';
+          const isStreamingAsk = isStreaming && isLastMessage && mode === 'ask' && msg.role === 'assistant';
           
           const progressSource = msg.content ? stripJSONFromContent(msg.content) : '';
-          const progressSteps =
-            mode === 'edit'
-              ? (timelineLinesFromEvents(msg.events) || (progressSource ? extractProgressSteps(progressSource) : []))
-              : [];
+          const progressSteps = (() => {
+            if (!(mode === 'edit' || mode === 'ask')) return [];
+            const fromEvents = timelineLinesFromEvents(msg.events);
+            if (fromEvents.length > 0) return fromEvents;
+            return progressSource ? extractProgressSteps(progressSource) : [];
+          })();
           const applyingElementIds = isStreamingEdit ? getApplyingElementIds(msg.events) : [];
           const applyMeta = mode === 'edit' ? getApplyMeta(msg.events) : null;
-
+          
           // Get all elements being edited - from completed edits or detected during streaming
           const completedEditElements = hasEdits && msg.edits
             ? msg.edits.map(e => {
@@ -715,9 +718,9 @@ export default function AIChat({
             if (reasons.length > 0) {
               displayContent = reasons.join('\n\n');
             }
-          } else if (isStreamingEdit) {
-            // In edit mode while streaming, only show the progress stack (Cursor-like),
-            // not the verbose planning/analysis text.
+          } else if (isStreamingEdit || isStreamingAsk) {
+            // While streaming (edit/ask), prefer the progress stack (Cursor-like)
+            // and avoid duplicating verbose intermediate text in the body.
             displayContent = '';
           } else if (msg.content) {
             // In edit mode during streaming, completely hide content if it contains JSON
@@ -737,8 +740,8 @@ export default function AIChat({
                 {msg.role === 'user' ? <User size={14} /> : <Bot size={14} />}
               </div>
               <div className="ai-message-bubble">
-                {/* Edit-mode progress (Cursor-like) */}
-                {isStreamingEdit && progressSteps.length > 0 && (
+                {/* Progress timeline (Cursor-like) */}
+                {(isStreamingEdit || isStreamingAsk) && progressSteps.length > 0 && (
                   <div className="ai-progress">
                     {progressSteps.map((line, idx) => {
                       const isActive = idx === progressSteps.length - 1;

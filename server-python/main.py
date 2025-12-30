@@ -1,6 +1,6 @@
 import os
 import json
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -146,6 +146,44 @@ async def stream_chat(request: ChatRequest):
             "Connection": "keep-alive"
         }
     )
+
+
+@app.post("/api/embed/project/{project_id}")
+async def embed_project(project_id: str):
+    """Compute/upsert embeddings for a single project (best-effort)."""
+    if not llm_service.is_configured():
+        raise HTTPException(status_code=503, detail="AI not configured")
+    try:
+        result = await llm_service.embed_project_elements(project_id)
+        return {"status": "ok", **result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Embedding failed: {str(e)}")
+
+
+@app.post("/api/embed/backfill")
+async def embed_backfill(projectId: Optional[str] = None):
+    """Backfill embeddings for one project or all projects (best-effort)."""
+    if not llm_service.is_configured():
+        raise HTTPException(status_code=503, detail="AI not configured")
+    await llm_service._ensure_db_pool()
+    if not llm_service.db_pool:
+        raise HTTPException(status_code=500, detail="Database not available")
+
+    try:
+        project_ids: List[str] = []
+        if projectId:
+            project_ids = [projectId]
+        else:
+            async with llm_service.db_pool.acquire() as conn:
+                rows = await conn.fetch("SELECT id::text AS id FROM projects ORDER BY updated_at DESC")
+                project_ids = [r["id"] for r in rows]
+
+        results: Dict[str, Any] = {}
+        for pid in project_ids:
+            results[pid] = await llm_service.embed_project_elements(pid)
+        return {"status": "ok", "projects": len(project_ids), "results": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Backfill failed: {str(e)}")
 
 
 @app.post("/api/command", response_model=CommandResponse)

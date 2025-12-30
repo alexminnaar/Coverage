@@ -177,31 +177,61 @@ async def run_edit_loop(
             terms_result = await llm_service.extract_search_terms_agent.run(terms_prompt, deps=deps)
             state.search_terms = _extract_search_terms(get_result_output(terms_result))
 
-            # 2) try DB first
+            # 2) try vector retrieval first (best-effort), then keyword DB
             element_ids: list[str] = []
             if deps.project_id and deps.db_pool and state.search_terms:
-                await emit({"type": "tool_call", "tool": "db_search", "query": state.search_terms, "attempt": state.locate_attempts})
-                element_ids = await llm_service._query_elements_by_search(
+                vec_query = state.user_prompt + (f"\n\nSelected: {state.selected_text}" if state.selected_text else "")
+                await emit(
+                    {
+                        "type": "tool_call",
+                        "tool": "vec_search",
+                        "query": vec_query[:2000],
+                        "attempt": state.locate_attempts,
+                    }
+                )
+                element_ids = await llm_service.vector_search_elements(
                     deps.project_id,
-                    state.search_terms,
+                    vec_query,
+                    top_k=12 if not broaden else 25,
                     element_types=["dialogue", "character", "action", "scene-heading"],
                 )
-                await emit({"type": "tool_result", "tool": "db_search", "count": len(element_ids)})
+                await emit({"type": "tool_result", "tool": "vec_search", "count": len(element_ids)})
+
+                if not element_ids:
+                    await emit(
+                        {
+                            "type": "tool_call",
+                            "tool": "db_search",
+                            "query": state.search_terms,
+                            "attempt": state.locate_attempts,
+                        }
+                    )
+                    element_ids = await llm_service._query_elements_by_search(
+                        deps.project_id,
+                        state.search_terms,
+                        element_types=["dialogue", "character", "action", "scene-heading"],
+                    )
+                    await emit({"type": "tool_result", "tool": "db_search", "count": len(element_ids)})
                 if element_ids:
                     state.relevant_element_ids = element_ids
-                    await emit({"type": "status", "message": f"[Locating] Found {len(element_ids)} relevant elements via database"})
+                    await emit({"type": "status", "message": f"[Locating] Found {len(element_ids)} relevant elements via retrieval"})
                     continue
 
-            # LLM fallback locate is only allowed when explicitly using full context.
-            if state.context_policy == "full":
-                await emit({"type": "status", "message": "[Locating] No database matches, using LLM fallback"})
+            # LLM fallback locate: safe even in "scene_plus_adjacent" because deps.scene_context is a bounded window.
+            if deps.scene_context:
+                await emit({"type": "status", "message": "[Locating] No database matches, using LLM fallback in current context window"})
                 locate_prompt = (
                     f"Intent: {state.intent}\n\n"
-                    f"Find relevant element IDs in this context:\n{deps.scene_context}"
+                    "Find the most relevant element IDs to edit in this context window. "
+                    "Only return IDs that appear in the window.\n\n"
+                    f"Context window:\n{deps.scene_context}"
                 )
                 locate_result = await llm_service.locate_scenes_agent.run(locate_prompt, deps=deps)
                 locate_text = get_result_output(locate_result)
                 ids = UUID_RE.findall(locate_text)
+                if not ids and state.context_element_ids:
+                    # Last resort: give the loop *something* to work with; refine/propose steps can narrow.
+                    ids = list(state.context_element_ids)[:20]
                 state.relevant_element_ids = ids
                 await emit({"type": "status", "message": f"[Locating] Found {len(ids)} relevant elements via LLM"})
                 continue

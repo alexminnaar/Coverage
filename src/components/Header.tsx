@@ -416,9 +416,12 @@ export default function Header({
             onClick={onShowWritingGoals}
             title="Writing Goals"
           >
-            <span className="goal-text">
-              <strong>{goalProgress.current}</strong>/{goalProgress.target} {goalProgress.type}
+            <span className="goal-number">
+              <span className="goal-current">{goalProgress.current}</span>
+              <span className="goal-sep">/</span>
+              <span className="goal-target">{goalProgress.target}</span>
             </span>
+            <span className="goal-label">{goalProgress.type}</span>
           </button>
         )}
 

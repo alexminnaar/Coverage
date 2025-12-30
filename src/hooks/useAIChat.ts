@@ -80,18 +80,13 @@ function parseEditProposals(
               : undefined,
           };
 
-          // Debug logging
-          if (result.newElements && result.newElements.length > 0) {
-            console.log('✅ Extracted newElements:', result.newElements);
-          }
-
           return result;
         });
 
         return processedEdits;
       }
     } catch (e) {
-      console.warn('Failed to parse AI edit from final event:', e);
+      // Fallthrough to other parsing methods if JSON fails
       // Fallthrough to other parsing methods if JSON fails
     }
   }
@@ -230,7 +225,7 @@ export function useAIChat(
     // Add empty assistant message (in edit mode we also track typed streaming events)
     setMessages(prev => [
       ...prev,
-      { role: 'assistant', content: '', events: mode === 'edit' ? [] : undefined }
+      { role: 'assistant', content: '', events: (mode === 'edit' || mode === 'ask') ? [] : undefined }
     ]);
 
     try {
@@ -261,18 +256,18 @@ export function useAIChat(
           }
 
           for (const objStr of objects) {
-            try {
+        try {
               const event = JSON.parse(objStr) as AIStreamEvent;
               typedEvents.push(event);
-
-              if (event.type === 'status') {
+          
+          if (event.type === 'status') {
                 fullResponse += (event as any).message + '\n';
               } else if (event.type === 'final' && (event as any).edits) {
                 const editsPayload = (event as any).edits;
                 if (editsPayload.edits && Array.isArray(editsPayload.edits)) {
                   finalEdits = editsPayload.edits
                     .filter((edit: any) => {
-                      const elementExists = elements?.some(el => el.id === edit.elementId);
+                const elementExists = elements?.some(el => el.id === edit.elementId);
                       return (
                         edit.elementId &&
                         edit.originalContent !== undefined &&
@@ -281,14 +276,14 @@ export function useAIChat(
                       );
                     })
                     .map((edit: any) => ({
-                      elementId: edit.elementId,
-                      elementType: edit.elementType || 'action',
-                      originalContent: edit.originalContent || '',
-                      newContent: edit.newContent || '',
-                      reason: edit.reason,
-                      newElements: edit.newElements,
-                    }));
-                }
+                elementId: edit.elementId,
+                elementType: edit.elementType || 'action',
+                originalContent: edit.originalContent || '',
+                newContent: edit.newContent || '',
+                reason: edit.reason,
+                newElements: edit.newElements,
+              }));
+            }
               } else if (event && Array.isArray((event as any).edits)) {
                 // Legacy final payload shape: {"edits":[...]} (no typed wrapper)
                 finalEdits = (event as any).edits
@@ -317,16 +312,18 @@ export function useAIChat(
             }
           }
         } else {
-          // Ask mode: preserve existing behavior (mostly plain text deltas)
+          // Ask mode: typed events by default. We still tolerate plain text.
           try {
-            const event = JSON.parse(chunk);
+            const event = JSON.parse(chunk) as AIStreamEvent;
+            typedEvents.push(event);
 
             if (event.type === 'status') {
-              fullResponse += event.message + '\n';
-            } else if (event.type === 'final' && event.edits) {
-              fullResponse += JSON.stringify(event.edits, null, 2);
+              fullResponse += (event as any).message + '\n';
+            } else if (event.type === 'final' && (event as any).content) {
+              // Final answer payload
+              fullResponse = String((event as any).content);
             } else {
-              fullResponse += chunk;
+              // decision/tool events: keep them in typedEvents, don't pollute transcript
             }
           } catch (e) {
             fullResponse += chunk;
@@ -348,7 +345,7 @@ export function useAIChat(
               events: typedEvents
             };
           } else {
-            updated[updated.length - 1] = { role: 'assistant', content: fullResponse };
+            updated[updated.length - 1] = { ...(lastMsg as any), role: 'assistant', content: fullResponse, events: typedEvents };
           }
           return updated;
         });

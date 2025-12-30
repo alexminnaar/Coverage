@@ -80,10 +80,6 @@ export default function ScriptBlock({
   useEffect(() => {
     const textarea = textareaRef.current;
     if (textarea) {
-      // #region agent log
-      const computedStyle = window.getComputedStyle(textarea);
-      fetch('http://127.0.0.1:7242/ingest/8eea76fe-82e8-4500-962a-7611c3fdf401',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'ScriptBlock.tsx:80',message:'Resize effect triggered',data:{elementId:element.id,elementType:element.type,contentLength:element.content.length,isFocused,width:computedStyle.width,padding:computedStyle.padding,margin:computedStyle.margin,scrollHeight:textarea.scrollHeight,clientHeight:textarea.clientHeight,offsetHeight:textarea.offsetHeight},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
-      // #endregion
       // Reset height computation
       textarea.style.height = '0px';
       // Force reflow
@@ -91,9 +87,6 @@ export default function ScriptBlock({
       // Set to scroll height
       const newHeight = textarea.scrollHeight + 'px';
       textarea.style.height = newHeight;
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/8eea76fe-82e8-4500-962a-7611c3fdf401',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'ScriptBlock.tsx:88',message:'After resize calculation',data:{elementId:element.id,newHeight,scrollHeight:textarea.scrollHeight,clientHeight:textarea.clientHeight},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
-      // #endregion
     }
   }, [element.content, element.id, pendingEdit]);
 
@@ -101,10 +94,6 @@ export default function ScriptBlock({
   useEffect(() => {
     const textarea = textareaRef.current;
     if (textarea) {
-      // #region agent log
-      const computedStyle = window.getComputedStyle(textarea);
-      fetch('http://127.0.0.1:7242/ingest/8eea76fe-82e8-4500-962a-7611c3fdf401',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'ScriptBlock.tsx:95',message:'Focus state changed - recalculating height',data:{elementId:element.id,elementType:element.type,isFocused,width:computedStyle.width,padding:computedStyle.padding,margin:computedStyle.margin,scrollHeightBefore:textarea.scrollHeight,clientHeightBefore:textarea.clientHeight},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
-      // #endregion
       // Reset height computation
       textarea.style.height = '0px';
       // Force reflow
@@ -112,9 +101,6 @@ export default function ScriptBlock({
       // Set to scroll height
       const newHeight = textarea.scrollHeight + 'px';
       textarea.style.height = newHeight;
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/8eea76fe-82e8-4500-962a-7611c3fdf401',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'ScriptBlock.tsx:103',message:'After focus-based resize',data:{elementId:element.id,newHeight,scrollHeight:textarea.scrollHeight,clientHeight:textarea.clientHeight},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
-      // #endregion
     }
   }, [isFocused, element.id, element.type]);
 
@@ -259,28 +245,8 @@ export default function ScriptBlock({
   ].filter(Boolean).join(' ');
 
   const handleFocus = () => {
-    // #region agent log
-    const textarea = textareaRef.current;
-    if (textarea) {
-      const computedStyle = window.getComputedStyle(textarea);
-      const wrapper = textarea.parentElement;
-      const wrapperStyle = wrapper ? window.getComputedStyle(wrapper) : null;
-      fetch('http://127.0.0.1:7242/ingest/8eea76fe-82e8-4500-962a-7611c3fdf401',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'ScriptBlock.tsx:232',message:'BEFORE focus - dimensions and styles',data:{elementId:element.id,elementType:element.type,textareaWidth:computedStyle.width,textareaPadding:computedStyle.padding,textareaMargin:computedStyle.margin,textareaScrollHeight:textarea.scrollHeight,textareaClientHeight:textarea.clientHeight,textareaOffsetHeight:textarea.offsetHeight,wrapperWidth:wrapperStyle?.width,wrapperPadding:wrapperStyle?.padding,wrapperMargin:wrapperStyle?.margin,contentLength:element.content.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-    }
-    // #endregion
     setIsFocused(true);
     onFocus?.();
-    // #region agent log
-    // Use setTimeout to capture styles after focus is applied
-    setTimeout(() => {
-      if (textarea) {
-        const computedStyle = window.getComputedStyle(textarea);
-        const wrapper = textarea.parentElement;
-        const wrapperStyle = wrapper ? window.getComputedStyle(wrapper) : null;
-        fetch('http://127.0.0.1:7242/ingest/8eea76fe-82e8-4500-962a-7611c3fdf401',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'ScriptBlock.tsx:240',message:'AFTER focus - dimensions and styles',data:{elementId:element.id,elementType:element.type,textareaWidth:computedStyle.width,textareaPadding:computedStyle.padding,textareaMargin:computedStyle.margin,textareaScrollHeight:textarea.scrollHeight,textareaClientHeight:textarea.clientHeight,textareaOffsetHeight:textarea.offsetHeight,wrapperWidth:wrapperStyle?.width,wrapperPadding:wrapperStyle?.padding,wrapperMargin:wrapperStyle?.margin,contentLength:element.content.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-      }
-    }, 0);
-    // #endregion
   };
 
   const renderStandardBlock = () => (
@@ -316,13 +282,6 @@ export default function ScriptBlock({
           onKeyDown={handleKeyDown}
           onFocus={handleFocus}
           onBlur={() => {
-            // #region agent log
-            const textarea = textareaRef.current;
-            if (textarea) {
-              const computedStyle = window.getComputedStyle(textarea);
-              fetch('http://127.0.0.1:7242/ingest/8eea76fe-82e8-4500-962a-7611c3fdf401',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'ScriptBlock.tsx:269',message:'On blur - dimensions',data:{elementId:element.id,elementType:element.type,textareaWidth:computedStyle.width,textareaPadding:computedStyle.padding,textareaMargin:computedStyle.margin,textareaScrollHeight:textarea.scrollHeight,textareaClientHeight:textarea.clientHeight},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-            }
-            // #endregion
             setIsFocused(false);
           }}
           placeholder={getPlaceholder()}
@@ -343,13 +302,6 @@ export default function ScriptBlock({
 
   // Render Diff View if there is a pending edit
   if (pendingEdit) {
-    // Debug: log what we have
-    console.log('🔍 ScriptBlock rendering pendingEdit:', {
-      hasNewElements: !!pendingEdit.newElements,
-      newElementsCount: pendingEdit.newElements?.length || 0,
-      newElements: pendingEdit.newElements
-    });
-
     // Check if this is an insert-only operation (content unchanged)
     const isInsertOnly = pendingEdit.newContent === pendingEdit.originalContent;
 

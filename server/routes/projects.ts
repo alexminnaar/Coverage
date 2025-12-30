@@ -5,6 +5,12 @@ import { estimatePageCount } from '../utils/pageCount.js';
 
 const router = Router();
 
+function triggerProjectEmbedding(projectId: string): void {
+  // Best-effort: do not block the request. ai-service runs on the docker-compose network as `ai-service`.
+  const base = process.env.AI_SERVICE_URL || 'http://ai-service:3002';
+  fetch(`${base}/api/embed/project/${projectId}`, { method: 'POST' }).catch(() => {});
+}
+
 // Get all projects (metadata only)
 router.get('/', async (_req: Request, res: Response) => {
   try {
@@ -115,6 +121,7 @@ router.post('/', async (req: Request, res: Response) => {
       updatedAt: new Date(row.updated_at).getTime(),
     };
 
+    triggerProjectEmbedding(screenplay.id);
     res.status(201).json(created);
   } catch (error: any) {
     console.error('Error creating project:', error);
@@ -160,7 +167,31 @@ router.put('/:id', async (req: Request, res: Response) => {
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Project not found' });
+      // Upsert behavior: if the project doesn't exist yet, create it.
+      // This avoids noisy 404s during normal flows (new project + autosave).
+      const now = new Date();
+      const inserted = await query(
+        `INSERT INTO projects (id, title, author, data, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+         RETURNING id, title, author, created_at, updated_at`,
+        [
+          screenplay.id,
+          screenplay.title,
+          screenplay.author || '',
+          JSON.stringify(screenplay),
+          new Date(screenplay.createdAt || now.getTime()),
+        ]
+      );
+
+      const row = inserted.rows[0];
+      const created: Screenplay = {
+        ...screenplay,
+        createdAt: new Date(row.created_at).getTime(),
+        updatedAt: new Date(row.updated_at).getTime(),
+      };
+
+      triggerProjectEmbedding(screenplay.id);
+      return res.json(created);
     }
 
     const row = result.rows[0];
@@ -170,6 +201,7 @@ router.put('/:id', async (req: Request, res: Response) => {
       updatedAt: new Date(row.updated_at).getTime(),
     };
 
+    triggerProjectEmbedding(screenplay.id);
     res.json(updated);
   } catch (error) {
     console.error('Error updating project:', error);

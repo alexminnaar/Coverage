@@ -22,6 +22,12 @@ app.use(express.json({ limit: '10mb' }));
 app.use('/api/projects', projectRoutes);
 app.use('/api/writing', writingRoutes);
 
+// Health endpoint (used by the frontend to decide whether to persist to Postgres)
+app.get('/api/health', async (_req, res) => {
+  const dbConnected = await testConnection();
+  res.json({ status: 'ok', database_connected: dbConnected });
+});
+
 // Root endpoint
 app.get('/', (_req, res) => {
   res.json({ 

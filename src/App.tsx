@@ -511,7 +511,8 @@ function App() {
 
   const handleCompareRevisions = useCallback((rev1Id: string, rev2Id: string) => {
     // TODO: Open revision compare modal
-    console.log('Compare revisions:', rev1Id, rev2Id);
+    void rev1Id;
+    void rev2Id;
   }, []);
 
   // Toggle distraction-free mode
@@ -602,8 +603,6 @@ function App() {
         return prev;
       }
 
-      console.log('🎯 handleAcceptEdit called ONCE for:', elementId);
-
       // Parse the new content to check for multiple elements
       // Split by double newline which typically separates elements in Fountain/screenplays
 
@@ -613,17 +612,8 @@ function App() {
       const parts = edit.newContent.split(/\n\n+/);
       const isSimpleUpdate = parts.length <= 1 && (!edit.newElements || edit.newElements.length === 0);
 
-      console.log('Edit acceptance debug:', {
-        elementId,
-        partsLength: parts.length,
-        hasNewElements: !!edit.newElements,
-        newElementsCount: edit.newElements?.length || 0,
-        isSimpleUpdate
-      });
-
       if (isSimpleUpdate) {
         // Simple update if only one part and no new elements
-        console.log('Taking simple update path');
         setScreenplay(sp => ({
           ...sp,
           elements: sp.elements.map(el =>
@@ -640,8 +630,6 @@ function App() {
 
           // Check if this is an insert-only operation (no actual edit to the element)
           const isInsertOnly = edit.originalContent === edit.newContent;
-          console.log('📝 newContent being applied:', edit.newContent);
-          console.log('🔄 Insert-only operation:', isInsertOnly);
 
           // Only update the element content if it actually changed
           const updatedFirstElement = isInsertOnly
@@ -653,7 +641,6 @@ function App() {
           // Check if we have structured elements from the AI
           if (edit.newElements && edit.newElements.length > 0) {
             // Use structured elements directly - no parsing needed!
-            console.log('✅ Using structured elements from AI:', edit.newElements);
             for (const structuredEl of edit.newElements) {
               newElements.push({
                 id: uuidv4(),
@@ -723,10 +710,6 @@ function App() {
 
           const newElementList = [...sp.elements];
           newElementList.splice(index, 1, updatedFirstElement, ...newElements);
-
-          console.log('🔍 After splice - element at index:', newElementList[index]);
-          console.log('🔍 Content length:', newElementList[index].content.length);
-          console.log('🔍 Full content:', newElementList[index].content);
 
           return {
             ...sp,

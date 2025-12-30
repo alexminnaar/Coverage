@@ -11,6 +11,39 @@ const PROJECT_PREFIX = 'screenwriter_project_';
 const CURRENT_PROJECT_KEY = 'screenwriter_current_project';
 const LEGACY_KEY = 'screenwriter_screenplay'; // Old single-project key
 
+let didAttemptLocalToApiSync = false;
+
+async function syncLocalProjectsToAPIIfNeeded(remote: ProjectMeta[]): Promise<ProjectMeta[]> {
+  // Only attempt once per page load to keep this predictable.
+  if (didAttemptLocalToApiSync) return remote;
+  didAttemptLocalToApiSync = true;
+
+  const remoteIds = new Set(remote.map(p => p.id));
+  const localMetas = loadProjectsListSync();
+  const missing = localMetas.filter(m => !remoteIds.has(m.id));
+  if (missing.length === 0) return remote;
+
+  // Try to push missing local-only projects into the API store.
+  for (const meta of missing) {
+    try {
+      const stored = localStorage.getItem(PROJECT_PREFIX + meta.id);
+      if (!stored) continue;
+      const localProject = JSON.parse(stored) as Screenplay;
+      if (!localProject?.id || !localProject?.elements) continue;
+      await apiClient.createProject(localProject);
+    } catch (e) {
+      // Best-effort: if one project fails, continue.
+      console.warn('Failed to sync local project to API:', meta.id, e);
+    }
+  }
+
+  try {
+    return await apiClient.fetchProjects();
+  } catch {
+    return remote;
+  }
+}
+
 // Create a new empty screenplay
 export function createDefaultScreenplay(): Screenplay {
   const now = Date.now();
@@ -47,7 +80,8 @@ export async function loadProjectsList(): Promise<ProjectMeta[]> {
   try {
     const useAPI = await apiClient.shouldUseAPI();
     if (useAPI) {
-      return await apiClient.fetchProjects();
+      const remote = await apiClient.fetchProjects();
+      return await syncLocalProjectsToAPIIfNeeded(remote);
     }
   } catch (e) {
     console.warn('API unavailable, falling back to localStorage:', e);
@@ -190,13 +224,8 @@ export async function saveProject(screenplay: Screenplay): Promise<void> {
     const useAPI = await apiClient.shouldUseAPI();
     if (useAPI) {
       try {
-        // Check if project exists
-        const existing = await apiClient.fetchProject(screenplay.id).catch(() => null);
-        if (existing) {
-          await apiClient.updateProject(toSave);
-        } else {
-          await apiClient.createProject(toSave);
-        }
+        // Use PUT upsert semantics on the backend to avoid noisy 404 probes.
+        await apiClient.updateProject(toSave);
         // Also save to localStorage as backup
         localStorage.setItem(PROJECT_PREFIX + screenplay.id, JSON.stringify(toSave));
         updateProjectInList(getProjectMeta(toSave));

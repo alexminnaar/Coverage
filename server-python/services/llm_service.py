@@ -34,7 +34,9 @@ from services.db_service import DBService
 from services.edit_types import ChatDeps, EditGraphDeps, EditGraphState, EditResponse
 from services.edit_graph import build_edit_graph
 from services.edit_loop import EditLoopState, run_edit_loop
+from services.ask_loop import AskLoopState, run_ask_loop
 from services.streaming import format_buffer_item, format_final_payload
+from services.embedding_service import EmbeddingService, EmbeddingConfig
 
 # Configure logging to stdout with immediate flushing
 logging.basicConfig(
@@ -64,10 +66,46 @@ class LLMService:
         self.db = DBService()
         self.db_pool: Optional[asyncpg.Pool] = None  # kept for compatibility with existing deps
 
+        self.embedding_service: Optional[EmbeddingService] = None
+        if self.openai is not None:
+            self.embedding_service = EmbeddingService(openai=self.openai, db=self.db, config=EmbeddingConfig())
+
     async def _ensure_db_pool(self):
         """Ensure PostgreSQL connection pool is initialized"""
         await self.db.ensure_pool()
         self.db_pool = self.db.pool
+
+    async def embed_project_elements(
+        self,
+        project_id: str,
+        *,
+        element_types: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, int]:
+        """Compute and upsert embeddings for a project (best-effort)."""
+        if not self.embedding_service:
+            return {"total": 0, "embedded": 0, "skipped": 0}
+        await self._ensure_db_pool()
+        return await self.embedding_service.upsert_project_embeddings(
+            project_id, element_types=element_types, limit=limit
+        )
+
+    async def vector_search_elements(
+        self,
+        project_id: str,
+        query_text: str,
+        *,
+        top_k: int = 12,
+        element_types: Optional[List[str]] = None,
+    ) -> List[str]:
+        """Return element IDs ordered by semantic similarity."""
+        if not self.embedding_service:
+            return []
+        await self._ensure_db_pool()
+        rows = await self.embedding_service.vector_search(
+            project_id, query_text, top_k=top_k, element_types=element_types
+        )
+        return [str(r["element_id"]) for r in rows]
 
     async def _query_elements_by_search(
         self,
@@ -367,7 +405,10 @@ class LLMService:
             return
         
         user_prompt = user_messages[-1]['content']
-        
+
+        # Default typed events for agentic modes unless client explicitly opts out.
+        effective_stream_events = True if stream_events is None else bool(stream_events)
+
         # Build message history from previous messages
         # Convert frontend message format to PydanticAI format
         from pydantic_ai.messages import ModelRequest, ModelResponse, UserPromptPart, TextPart
@@ -402,10 +443,68 @@ class LLMService:
             else:
                 i += 1
 
+        # Ask mode: prefer explicit ask loop (Cursor-like) unless disabled.
+        if mode == 'ask':
+            use_ask_loop = os.getenv("ASK_LOOP_ENABLED", "1").lower() not in ("0", "false", "no")
+            if use_ask_loop:
+                try:
+                    # Ask loop should work even without DB; only attempt to init DB when a project is provided.
+                    if project_id:
+                        try:
+                            await self._ensure_db_pool()
+                        except Exception as db_error:
+                            logger.warning(f"[ask_loop] DB unavailable, continuing without DB: {db_error}")
+                            self.db_pool = None
+                    deps = EditGraphDeps(
+                        scene_context=scene_context or '',
+                        message_history=message_history,
+                        project_id=project_id,
+                        db_pool=self.db_pool,
+                    )
+
+                    queue: "asyncio.Queue[dict]" = asyncio.Queue()
+
+                    async def emit(evt: dict) -> None:
+                        await queue.put(evt)
+
+                    ask_state = AskLoopState(
+                        question=user_prompt,
+                        scene_context=scene_context or '',
+                        message_history=message_history,
+                        selected_element_id=selected_element_id,
+                        selected_text=selected_text,
+                        context_policy=context_policy or "scene_plus_adjacent",
+                        context_element_ids=context_element_ids or [],
+                    )
+
+                    loop_task = asyncio.create_task(run_ask_loop(self, state=ask_state, deps=deps, emit=emit))
+
+                    while True:
+                        if loop_task.done() and queue.empty():
+                            break
+                        try:
+                            evt = await asyncio.wait_for(queue.get(), timeout=0.1)
+                        except asyncio.TimeoutError:
+                            continue
+                        rendered = format_buffer_item(evt, effective_stream_events)
+                        if rendered:
+                            yield rendered
+
+                    answer = await loop_task
+                    if effective_stream_events:
+                        yield json.dumps({"type": "final", "content": answer})
+                    else:
+                        # Legacy ask: just stream plain text answer (status lines already emitted above).
+                        yield answer
+                except Exception as ask_error:
+                    logger.exception(f"[ask_loop] error: {ask_error}")
+                    # Fall back to legacy streaming below
+                else:
+                    return
+
         # For edit mode, prefer the explicit loop (Cursor-like) unless explicitly disabled.
         if mode == 'edit':
             # Default typed events for edit mode unless client explicitly opts out.
-            effective_stream_events = True if stream_events is None else bool(stream_events)
             use_loop = os.getenv("EDIT_LOOP_ENABLED", "1").lower() not in ("0", "false", "no")
 
             if use_loop:

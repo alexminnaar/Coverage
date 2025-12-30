@@ -4,10 +4,20 @@ import { Screenplay, ProjectMeta, WritingGoal, WritingSession } from '../types';
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api';
 
+function resolveApiUrl(path: string): string {
+  // When API_BASE is relative (e.g. "/api"), `new URL("/api/...")` throws unless a base is provided.
+  // We always want this to work in browser environments behind nginx proxying.
+  if (API_BASE.startsWith('http://') || API_BASE.startsWith('https://')) {
+    return `${API_BASE}${path}`;
+  }
+  const origin = typeof window !== 'undefined' ? window.location.origin : 'http://localhost';
+  return new URL(`${API_BASE}${path}`, origin).toString();
+}
+
 // Check if API is available
 export async function checkAPIAvailability(): Promise<boolean> {
   try {
-    const response = await fetch(`${API_BASE}/health`);
+    const response = await fetch(resolveApiUrl('/health'));
     return response.ok;
   } catch {
     return false;
@@ -93,10 +103,8 @@ export async function saveWritingGoal(goal: WritingGoal): Promise<WritingGoal> {
 
 // Writing Sessions API
 export async function fetchWritingSessions(projectId: string, limit?: number): Promise<WritingSession[]> {
-  const url = new URL(`${API_BASE}/writing/sessions/${projectId}`);
-  if (limit) {
-    url.searchParams.set('limit', limit.toString());
-  }
+  const url = new URL(resolveApiUrl(`/writing/sessions/${projectId}`));
+  if (limit) url.searchParams.set('limit', limit.toString());
   const response = await fetch(url.toString());
   if (!response.ok) {
     throw new Error('Failed to fetch writing sessions');
@@ -117,21 +125,26 @@ export async function saveWritingSessions(sessions: WritingSession[]): Promise<v
 
 // Storage mode detection
 let useAPI: boolean | null = null;
+let lastAvailabilityCheckMs = 0;
+const API_AVAILABILITY_TTL_MS = 10_000;
 
 export async function shouldUseAPI(): Promise<boolean> {
-  if (useAPI !== null) {
+  const now = Date.now();
+
+  // Fast path: recently checked
+  if (useAPI !== null && now - lastAvailabilityCheckMs < API_AVAILABILITY_TTL_MS) {
     return useAPI;
   }
-  
-  // Check if API is available
+
+  // Always (re)check availability periodically so we can recover from transient outages
+  // (e.g. backend container restarting). Avoid permanently pinning to localStorage-only mode.
   const available = await checkAPIAvailability();
   useAPI = available;
-  
-  // Store preference in localStorage
-  if (available) {
-    localStorage.setItem('screenwriter_use_api', 'true');
-  }
-  
+  lastAvailabilityCheckMs = now;
+
+  // Store last known state for reloads; we may still re-check on next call.
+  localStorage.setItem('screenwriter_use_api', available ? 'true' : 'false');
+
   return available;
 }
 
