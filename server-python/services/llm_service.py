@@ -6,6 +6,7 @@ import re
 import logging
 import sys
 import asyncio
+import time
 from typing import AsyncGenerator, Optional, List, Dict, Any
 from dataclasses import dataclass, field
 from openai import AsyncOpenAI
@@ -29,6 +30,11 @@ from services.prompts import (
     APPLY_EDITS_PROMPT,
     VERIFY_PROMPT,
     SUMMARIZE_PROMPT,
+    ASK_QUERY_VARIANTS_PROMPT,
+    ASK_RERANK_PROMPT,
+    ASK_GROUNDING_CHECK_PROMPT,
+    EDIT_VERIFY_STRUCTURED_PROMPT,
+    EDIT_REVISE_EDITS_PROMPT,
 )
 from services.db_service import DBService
 from services.edit_types import ChatDeps, EditGraphDeps, EditGraphState, EditResponse
@@ -37,6 +43,7 @@ from services.edit_loop import EditLoopState, run_edit_loop
 from services.ask_loop import AskLoopState, run_ask_loop
 from services.streaming import format_buffer_item, format_final_payload
 from services.embedding_service import EmbeddingService, EmbeddingConfig
+from services.observability.langfuse_client import LangfuseCtx, langfuse_client
 
 # Configure logging to stdout with immediate flushing
 logging.basicConfig(
@@ -318,6 +325,39 @@ class LLMService:
             system_prompt=SUMMARIZE_PROMPT,
         )
 
+        # Ask loop helpers (Cursor-like retrieval + gating)
+        self.ask_query_variants_agent = Agent(
+            'openai:gpt-4.1',
+            deps_type=EditGraphDeps,
+            system_prompt=ASK_QUERY_VARIANTS_PROMPT,
+        )
+
+        self.ask_rerank_agent = Agent(
+            'openai:gpt-4.1',
+            deps_type=EditGraphDeps,
+            system_prompt=ASK_RERANK_PROMPT,
+        )
+
+        self.ask_grounding_agent = Agent(
+            'openai:gpt-4.1',
+            deps_type=EditGraphDeps,
+            system_prompt=ASK_GROUNDING_CHECK_PROMPT,
+        )
+
+        # Edit loop: structured verification + revise pass
+        self.edit_verify_structured_agent = Agent(
+            'openai:gpt-4.1',
+            deps_type=EditGraphDeps,
+            system_prompt=EDIT_VERIFY_STRUCTURED_PROMPT,
+        )
+
+        self.edit_revise_edits_agent = Agent(
+            'openai:gpt-4.1',
+            deps_type=EditGraphDeps,
+            system_prompt=EDIT_REVISE_EDITS_PROMPT,
+            result_type=EditResponse,
+        )
+
         # Build the graph
         self._build_edit_graph()
 
@@ -373,6 +413,7 @@ class LLMService:
         self,
         messages: List[dict],
         scene_context: Optional[str] = None,
+        global_index: Optional[str] = None,
         mode: str = 'ask',
         project_id: Optional[str] = None,
         stream_events: Optional[bool] = None,
@@ -380,6 +421,7 @@ class LLMService:
         selected_text: Optional[str] = None,
         context_policy: Optional[str] = None,
         context_element_ids: Optional[List[str]] = None,
+        trace_ctx: Optional[LangfuseCtx] = None,
     ) -> AsyncGenerator[str, None]:
         """Chat response (streaming) using PydanticAI.
 
@@ -460,11 +502,54 @@ class LLMService:
                         message_history=message_history,
                         project_id=project_id,
                         db_pool=self.db_pool,
+                        global_index=global_index,
                     )
 
                     queue: "asyncio.Queue[dict]" = asyncio.Queue()
 
                     async def emit(evt: dict) -> None:
+                        # Langfuse span per step-ish event (typed clients only)
+                        try:
+                            if trace_ctx and isinstance(evt, dict) and evt.get("type") in ("decision", "tool_call", "tool_result", "status"):
+                                evt_type = str(evt.get("type"))
+                                if evt_type == "tool_call":
+                                    name = f"{evt.get('tool', 'tool')}.call"
+                                    langfuse_client.span(
+                                        trace_ctx,
+                                        name=f"ask.{name}",
+                                        metadata={k: v for k, v in evt.items() if k not in ("message",)},
+                                        input=None,
+                                        output=evt,
+                                    )
+                                elif evt_type == "tool_result":
+                                    name = f"{evt.get('tool', 'tool')}.result"
+                                    langfuse_client.span(
+                                        trace_ctx,
+                                        name=f"ask.{name}",
+                                        metadata={k: v for k, v in evt.items() if k not in ("message",)},
+                                        input=None,
+                                        output=evt,
+                                    )
+                                elif evt_type == "decision":
+                                    name = f"decision.{evt.get('action', 'step')}"
+                                    langfuse_client.span(
+                                        trace_ctx,
+                                        name=f"ask.{name}",
+                                        metadata={k: v for k, v in evt.items() if k not in ("message",)},
+                                        input=None,
+                                        output=evt,
+                                    )
+                                else:
+                                    name = "status"
+                                    langfuse_client.span(
+                                        trace_ctx,
+                                        name=f"ask.{name}",
+                                        metadata={k: v for k, v in evt.items() if k not in ("message",)},
+                                        input=None,
+                                        output=evt,
+                                    )
+                        except Exception:
+                            pass
                         await queue.put(evt)
 
                     ask_state = AskLoopState(
@@ -520,12 +605,64 @@ class LLMService:
                         message_history=message_history,
                         project_id=project_id,
                         db_pool=self.db_pool,
+                        global_index=global_index,
                     )
 
                     # Stream events incrementally from the loop via an async queue.
                     queue: "asyncio.Queue[dict]" = asyncio.Queue()
 
                     async def emit(evt: dict) -> None:
+                        # Langfuse span per step-ish event (typed clients only)
+                        try:
+                            if trace_ctx and isinstance(evt, dict) and evt.get("type") in ("decision", "tool_call", "tool_result", "status", "apply_started", "apply_done"):
+                                evt_type = str(evt.get("type"))
+                                if evt_type == "tool_call":
+                                    name = f"{evt.get('tool', 'tool')}.call"
+                                    langfuse_client.span(
+                                        trace_ctx,
+                                        name=f"edit.{name}",
+                                        metadata={k: v for k, v in evt.items() if k not in ("message",)},
+                                        input=None,
+                                        output=evt,
+                                    )
+                                elif evt_type == "tool_result":
+                                    name = f"{evt.get('tool', 'tool')}.result"
+                                    langfuse_client.span(
+                                        trace_ctx,
+                                        name=f"edit.{name}",
+                                        metadata={k: v for k, v in evt.items() if k not in ("message",)},
+                                        input=None,
+                                        output=evt,
+                                    )
+                                elif evt_type == "decision":
+                                    name = f"decision.{evt.get('action', 'step')}"
+                                    langfuse_client.span(
+                                        trace_ctx,
+                                        name=f"edit.{name}",
+                                        metadata={k: v for k, v in evt.items() if k not in ("message",)},
+                                        input=None,
+                                        output=evt,
+                                    )
+                                elif evt_type in ("apply_started", "apply_done"):
+                                    name = evt_type
+                                    langfuse_client.span(
+                                        trace_ctx,
+                                        name=f"edit.{name}",
+                                        metadata={k: v for k, v in evt.items() if k not in ("message",)},
+                                        input=None,
+                                        output=evt,
+                                    )
+                                else:
+                                    name = "status"
+                                    langfuse_client.span(
+                                        trace_ctx,
+                                        name=f"edit.{name}",
+                                        metadata={k: v for k, v in evt.items() if k not in ("message",)},
+                                        input=None,
+                                        output=evt,
+                                    )
+                        except Exception:
+                            pass
                         await queue.put(evt)
 
                     loop_state = EditLoopState(
@@ -578,7 +715,8 @@ class LLMService:
                     scene_context=scene_context or '',
                     message_history=message_history,
                     project_id=project_id,
-                    db_pool=self.db_pool
+                    db_pool=self.db_pool,
+                    global_index=global_index,
                 )
 
                 # Start with first node (PlanIntentNode)

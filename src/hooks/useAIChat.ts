@@ -1,6 +1,7 @@
-import { useState, useCallback, useRef } from 'react';
+import { useMemo, useState, useCallback, useRef } from 'react';
 import { streamChat, ChatMessage, EditProposal, AIStreamEvent } from '../services/aiClient';
 import { ElementType } from '../types';
+import { buildGlobalIndex } from '../utils/globalIndex';
 
 interface UseAIChatResult {
   messages: ChatMessage[];
@@ -191,6 +192,12 @@ export function useAIChat(
   const [error, setError] = useState<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
 
+  const globalIndex = useMemo(() => {
+    if (!elements || elements.length === 0) return undefined;
+    // Best-effort: build a compact index for query rewriting/reranking/verification.
+    return buildGlobalIndex(elements as any);
+  }, [elements]);
+
   const stopStreaming = useCallback(() => {
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
@@ -216,17 +223,21 @@ export function useAIChat(
 
     // Add user message
     const userMessage: ChatMessage = { role: 'user', content };
-    setMessages(prev => [...prev, userMessage]);
+    setMessages(prev => {
+      return [...prev, userMessage];
+    });
 
     // Start streaming assistant response
     setIsStreaming(true);
     abortControllerRef.current = new AbortController();
 
     // Add empty assistant message (in edit mode we also track typed streaming events)
-    setMessages(prev => [
-      ...prev,
-      { role: 'assistant', content: '', events: (mode === 'edit' || mode === 'ask') ? [] : undefined }
-    ]);
+    setMessages(prev => {
+      return [
+        ...prev,
+        { role: 'assistant', content: '', events: (mode === 'edit' || mode === 'ask') ? [] : undefined }
+      ];
+    });
 
     try {
       let fullResponse = '';
@@ -242,7 +253,10 @@ export function useAIChat(
         mode,
         projectId,
         abortControllerRef.current.signal,
-        requestMeta
+        {
+          ...requestMeta,
+          globalIndex,
+        }
       )) {
         // Edit mode: chunks may contain concatenated JSON events; parse robustly using a small stateful buffer.
         if (mode === 'edit') {
@@ -265,7 +279,8 @@ export function useAIChat(
               } else if (event.type === 'final' && (event as any).edits) {
                 const editsPayload = (event as any).edits;
                 if (editsPayload.edits && Array.isArray(editsPayload.edits)) {
-                  finalEdits = editsPayload.edits
+                  const rawEdits = editsPayload.edits;
+                  finalEdits = rawEdits
                     .filter((edit: any) => {
                 const elementExists = elements?.some(el => el.id === edit.elementId);
                       return (

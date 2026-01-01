@@ -30,6 +30,7 @@ class CommandRequest(BaseModel):
 class ChatRequest(BaseModel):
     messages: List[ChatMessage]
     sceneContext: Optional[str] = None
+    globalIndex: Optional[str] = None
     mode: Optional[Literal['ask', 'edit']] = 'ask'
     projectId: Optional[str] = None  # UUID of the screenplay project
     # Selection/context metadata to help the backend reason about scope.

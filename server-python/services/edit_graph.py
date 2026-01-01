@@ -38,7 +38,20 @@ def build_edit_graph(llm_service: Any) -> tuple[Graph, Type[BaseNode]]:
         llm_service: Any
 
         async def run(self, ctx: GraphRunContext[EditGraphState, EditGraphDeps]) -> "LocateScenesNode":
-            prompt = f"User request: {ctx.state.user_prompt}\n\nScreenplay context:\n{ctx.deps.scene_context}"
+            from services.prompts import PROMPT_CONTEXT_CONTRACT
+
+            global_bits = f"{ctx.deps.global_index}\n" if getattr(ctx.deps, "global_index", None) else ""
+            ctx_bits = ctx.deps.scene_context or ""
+            prompt = (
+                f"{PROMPT_CONTEXT_CONTRACT}\n\n"
+                "## User request\n"
+                f"{ctx.state.user_prompt}\n\n"
+                + ("## Global index\n" + global_bits + "\n" if global_bits else "")
+                + "## Scene context (verbatim, local excerpt)\n"
+                + "BEGIN_SCENE_CONTEXT\n"
+                + ctx_bits
+                + "\nEND_SCENE_CONTEXT\n"
+            )
             result = await self.llm_service.plan_intent_agent.run(prompt, deps=ctx.deps)
             output = get_result_output(result)
             ctx.state.intent = output

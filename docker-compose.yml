@@ -54,6 +54,12 @@ services:
     environment:
       PORT: 3002
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # Langfuse Cloud (observability)
+      LANGFUSE_ENABLED: ${LANGFUSE_ENABLED:-true}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-https://cloud.langfuse.com}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_LOG_CONTENT: ${LANGFUSE_LOG_CONTENT:-false}
       DATABASE_URL: postgresql://${DB_USER:-screenwriter}:${DB_PASSWORD:-screenwriter}@postgres:5432/${DB_NAME:-screenwriter}
       DB_HOST: postgres
       DB_PORT: 5432

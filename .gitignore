@@ -38,4 +38,9 @@ server/env.example.txt
 # Cursor / local tooling
 .cursor/
 
+# Debug output
+_debug/
+server/_debug/
+server-python/_debug/
+
 

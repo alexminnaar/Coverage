@@ -7,4 +7,5 @@ python-multipart==0.0.6
 pydantic-ai-slim[openai]==0.0.49
 pydantic-graph==0.0.49
 asyncpg==0.29.0
+langfuse>=2.0.0,<3.0.0
 

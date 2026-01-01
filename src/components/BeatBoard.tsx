@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo } from 'react';
+import { useEffect, useState, useCallback, useMemo } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import {
   ArrowLeft,
@@ -17,27 +17,35 @@ import TemplateSelector from './TemplateSelector';
 import BeatAIPanel from './BeatAIPanel';
 
 interface BeatBoardProps {
+  projectId?: string;
   beats: Beat[];
   beatStructure: BeatStructure;
   elements: ScriptElement[];
   onBeatsChange: (beats: Beat[]) => void;
   onStructureChange: (structure: BeatStructure) => void;
+  selectedBeatId?: string | null;
   onClose: () => void;
 }
 
 export default function BeatBoard({
+  projectId,
   beats,
   beatStructure,
   elements,
   onBeatsChange,
   onStructureChange,
+  selectedBeatId: externalSelectedBeatId = null,
   onClose,
 }: BeatBoardProps) {
-  const [selectedBeatId, setSelectedBeatId] = useState<string | null>(null);
+  const [selectedBeatId, setSelectedBeatId] = useState<string | null>(externalSelectedBeatId);
   const [draggedBeatId, setDraggedBeatId] = useState<string | null>(null);
   const [showStructureMenu, setShowStructureMenu] = useState(false);
   const [showTemplateSelector, setShowTemplateSelector] = useState(false);
   const [showAIPanel, setShowAIPanel] = useState(false);
+
+  useEffect(() => {
+    setSelectedBeatId(externalSelectedBeatId);
+  }, [externalSelectedBeatId]);
 
   // Handle applying a template
   const handleApplyTemplate = useCallback((templateBeats: Beat[]) => {
@@ -155,6 +163,107 @@ export default function BeatBoard({
       onBeatsChange([...otherActBeats, ...renumberedTargetBeats]);
     },
     [beats, onBeatsChange]
+  );
+
+  const applyBeatOps = useCallback(
+    (ops: any[]) => {
+      if (!ops || ops.length === 0) return;
+
+      const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(max, n));
+
+      const renumberAct = (all: Beat[], actIndex: number): Beat[] => {
+        const act = all
+          .filter(b => b.actIndex === actIndex)
+          .sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+          .map((b, i) => ({ ...b, order: i }));
+        const other = all.filter(b => b.actIndex !== actIndex);
+        return [...other, ...act];
+      };
+
+      let nextBeats = beats.slice();
+      const actCount = actNames.length;
+
+      for (const raw of ops) {
+        const op = raw as any;
+        if (!op || typeof op !== 'object') continue;
+
+        if (op.op === 'update' && op.id && op.updates && typeof op.updates === 'object') {
+          nextBeats = nextBeats.map(b => (b.id === op.id ? { ...b, ...op.updates } : b));
+          continue;
+        }
+
+        if (op.op === 'delete' && op.id) {
+          nextBeats = nextBeats.filter(b => b.id !== op.id);
+          if (selectedBeatId === op.id) {
+            setSelectedBeatId(null);
+          }
+          continue;
+        }
+
+        if (op.op === 'create' && op.beat) {
+          const actIndex = clamp(Number(op.actIndex ?? 0), 0, actCount - 1);
+          const insertAfterOrder = op.insertAfterOrder;
+          const actBeats = nextBeats
+            .filter(b => b.actIndex === actIndex)
+            .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+          const insertAt =
+            typeof insertAfterOrder === 'number'
+              ? clamp(insertAfterOrder + 1, 0, actBeats.length)
+              : actBeats.length;
+
+          const newBeat: Beat = {
+            id: uuidv4(),
+            title: op.beat.title ?? '',
+            description: op.beat.description ?? '',
+            color: op.beat.color,
+            linkedSceneId: op.beat.linkedSceneId,
+            actIndex,
+            order: insertAt,
+          };
+
+          const updatedAct = actBeats.slice();
+          updatedAct.splice(insertAt, 0, newBeat);
+          const renumberedAct = updatedAct.map((b, i) => ({ ...b, order: i }));
+          const other = nextBeats.filter(b => b.actIndex !== actIndex);
+          nextBeats = [...other, ...renumberedAct];
+          continue;
+        }
+
+        if (op.op === 'move' && op.id) {
+          const beat = nextBeats.find(b => b.id === op.id);
+          if (!beat) continue;
+          const fromAct = beat.actIndex;
+          const toAct = clamp(Number(op.targetActIndex ?? 0), 0, actCount - 1);
+
+          const without = nextBeats.filter(b => b.id !== op.id);
+          const targetActBeats = without
+            .filter(b => b.actIndex === toAct)
+            .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+
+          const insertAt = clamp(Number(op.targetOrder ?? 0), 0, targetActBeats.length);
+          const movedBeat: Beat = { ...beat, actIndex: toAct, order: insertAt };
+          targetActBeats.splice(insertAt, 0, movedBeat);
+
+          const renumberedTarget = targetActBeats.map((b, i) => ({ ...b, order: i }));
+          const other = without.filter(b => b.actIndex !== toAct);
+          nextBeats = [...other, ...renumberedTarget];
+
+          // Renumber the source act too (if different).
+          if (fromAct !== toAct) {
+            nextBeats = renumberAct(nextBeats, fromAct);
+          }
+          continue;
+        }
+      }
+
+      // Final pass: renumber all acts to guarantee stable ordering.
+      for (let i = 0; i < actCount; i++) {
+        nextBeats = renumberAct(nextBeats, i);
+      }
+
+      onBeatsChange(nextBeats);
+    },
+    [beats, onBeatsChange, actNames.length, actNames, selectedBeatId, onBeatsChange]
   );
 
   const handleStructureChange = (structure: BeatStructure) => {
@@ -342,11 +451,17 @@ export default function BeatBoard({
         isOpen={showAIPanel}
         onClose={() => setShowAIPanel(false)}
         beats={beats}
+        elements={elements}
+        projectId={projectId}
+        groundToScreenplay={false}
         actNames={actNames}
         scenes={scenes}
         selectedBeatId={selectedBeatId}
         onUpdateBeat={handleUpdateBeat}
         onAddBeat={handleAddBeatWithSeed}
+        onDeleteBeat={handleDeleteBeat}
+        onMoveBeat={handleMoveBeat}
+        onApplyOps={applyBeatOps}
       />
     </div>
   );

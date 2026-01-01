@@ -94,6 +94,7 @@ function App() {
   const [showTitlePage, setShowTitlePage] = useState(false);
   const [showStatistics, setShowStatistics] = useState(false);
   const [showBeatBoard, setShowBeatBoard] = useState(false);
+  const [beatBoardSelectedBeatId, setBeatBoardSelectedBeatId] = useState<string | null>(null);
   const [showSnapshots, setShowSnapshots] = useState(false);
   const [showRevisions, setShowRevisions] = useState(false);
   const [showPrintPreview, setShowPrintPreview] = useState(false);
@@ -972,17 +973,27 @@ function App() {
   const currentStreak = useMemo(() => calculateStreak(writingSessions), [writingSessions]);
   const longestStreak = useMemo(() => calculateLongestStreak(writingSessions), [writingSessions]);
 
+  const openBeatBoard = useCallback((beatId?: string) => {
+    setBeatBoardSelectedBeatId(beatId ?? null);
+    setShowBeatBoard(true);
+  }, []);
+
   // If Beat Board is open, show it instead of the main editor
   if (showBeatBoard) {
     return (
       <div className={`app ${distractionFree ? 'distraction-free' : ''}`}>
         <BeatBoard
+          projectId={screenplay.id}
           beats={screenplay.beats || []}
           beatStructure={screenplay.beatStructure || 'three-act'}
           elements={screenplay.elements}
           onBeatsChange={handleBeatsChange}
           onStructureChange={handleBeatStructureChange}
-          onClose={() => setShowBeatBoard(false)}
+          selectedBeatId={beatBoardSelectedBeatId}
+          onClose={() => {
+            setShowBeatBoard(false);
+            setBeatBoardSelectedBeatId(null);
+          }}
         />
       </div>
     );
@@ -1007,7 +1018,7 @@ function App() {
         onShowProjects={() => setShowProjectList(true)}
         onShowTitlePage={() => setShowTitlePage(true)}
         onShowStatistics={() => setShowStatistics(true)}
-        onShowBeatBoard={() => setShowBeatBoard(true)}
+        onShowBeatBoard={() => openBeatBoard()}
         onShowSnapshots={() => setShowSnapshots(true)}
         onUndo={undo}
         onRedo={redo}
@@ -1046,6 +1057,9 @@ function App() {
           scenes={scenes}
           characters={characters}
           elements={screenplay.elements}
+          beats={screenplay.beats || []}
+          beatStructure={screenplay.beatStructure || 'three-act'}
+          onOpenBeatBoard={openBeatBoard}
           onSceneClick={handleFocusElement}
           onSynopsisChange={handleSynopsisChange}
           onNotesChange={handleNotesChange}
@@ -1108,6 +1122,8 @@ function App() {
         isOpen={showAIChat}
         onClose={() => setShowAIChat(false)}
         elements={screenplay.elements}
+        beats={screenplay.beats || []}
+        beatStructure={screenplay.beatStructure || 'three-act'}
         // Prefer the editor's currently active element; fall back to navigator-driven focus.
         currentElementId={activeElementId ?? focusedElementId}
         onProposeEdits={handleProposeEdits}

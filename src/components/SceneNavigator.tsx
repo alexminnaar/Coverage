@@ -1,5 +1,5 @@
-import { useState, useRef } from 'react';
-import { ScriptElement } from '../types';
+import { useMemo, useRef, useState } from 'react';
+import { Beat, BeatStructure, BEAT_STRUCTURES, ScriptElement } from '../types';
 
 interface Scene {
   id: string;
@@ -18,18 +18,24 @@ interface SceneNavigatorProps {
   scenes: Scene[];
   characters: Character[];
   elements: ScriptElement[];
+  beats: Beat[];
+  beatStructure: BeatStructure;
+  onOpenBeatBoard: (beatId?: string) => void;
   onSceneClick: (id: string) => void;
   onSynopsisChange: (id: string, synopsis: string) => void;
   onNotesChange: (id: string, notes: string) => void;
   onReorderElements: (elements: ScriptElement[]) => void;
 }
 
-type TabType = 'scenes' | 'characters';
+type TabType = 'scenes' | 'characters' | 'beats';
 
 export default function SceneNavigator({ 
   scenes, 
   characters, 
   elements,
+  beats,
+  beatStructure,
+  onOpenBeatBoard,
   onSceneClick,
   onSynopsisChange,
   onNotesChange,
@@ -40,6 +46,21 @@ export default function SceneNavigator({
   const [draggedSceneId, setDraggedSceneId] = useState<string | null>(null);
   const [dragOverSceneId, setDragOverSceneId] = useState<string | null>(null);
   const dragCounter = useRef(0);
+
+  const actNames = useMemo(() => {
+    return BEAT_STRUCTURES[beatStructure] ?? BEAT_STRUCTURES['three-act'];
+  }, [beatStructure]);
+
+  const beatsByAct = useMemo(() => {
+    const grouped: Beat[][] = actNames.map(() => []);
+    for (const beat of beats) {
+      if (beat.actIndex >= 0 && beat.actIndex < actNames.length) {
+        grouped[beat.actIndex].push(beat);
+      }
+    }
+    for (const g of grouped) g.sort((a, b) => a.order - b.order);
+    return grouped;
+  }, [beats, actNames]);
 
   const toggleNotes = (sceneId: string) => {
     setExpandedNotes(prev => {
@@ -150,6 +171,11 @@ export default function SceneNavigator({
     }
   };
 
+  const hasLinkedScene = (sceneId?: string) => {
+    if (!sceneId) return false;
+    return elements.some((el) => el.id === sceneId && el.type === 'scene-heading');
+  };
+
   return (
     <aside className="scene-navigator">
       <div className="navigator-tabs">
@@ -166,6 +192,13 @@ export default function SceneNavigator({
         >
           Cast
           <span className="tab-count">{characters.length}</span>
+        </button>
+        <button
+          className={`nav-tab ${activeTab === 'beats' ? 'active' : ''}`}
+          onClick={() => setActiveTab('beats')}
+        >
+          Beats
+          <span className="tab-count">{beats.length}</span>
         </button>
       </div>
       
@@ -253,6 +286,67 @@ export default function SceneNavigator({
                   <span className="character-lines">{character.lineCount} {character.lineCount === 1 ? 'line' : 'lines'}</span>
                 </div>
               ))
+            )}
+          </div>
+        )}
+
+        {activeTab === 'beats' && (
+          <div className="beat-list">
+            {beats.length === 0 ? (
+              <div className="no-items">
+                <p>No beats yet.</p>
+                <p className="hint">Open Beat Board to add beats.</p>
+                <button className="beat-open-board-btn" onClick={() => onOpenBeatBoard()}>
+                  Open Beat Board
+                </button>
+              </div>
+            ) : (
+              actNames.map((actName, actIndex) => {
+                const actBeats = beatsByAct[actIndex] ?? [];
+                return (
+                  <div key={actIndex} className="beat-act">
+                    <div className="beat-act-header">
+                      <span className="beat-act-title">{actName}</span>
+                      <span className="beat-act-count">{actBeats.length}</span>
+                    </div>
+
+                    {actBeats.length === 0 ? (
+                      <div className="beat-act-empty">No beats in this act</div>
+                    ) : (
+                      <div className="beat-act-items">
+                        {actBeats.map((beat) => {
+                          const linkedOk = hasLinkedScene(beat.linkedSceneId);
+                          const handleClick = () => {
+                            if (linkedOk && beat.linkedSceneId) {
+                              onSceneClick(beat.linkedSceneId);
+                              return;
+                            }
+                            onOpenBeatBoard(beat.id);
+                          };
+
+                          return (
+                            <button
+                              key={beat.id}
+                              className={`beat-item ${linkedOk ? 'linked' : ''}`}
+                              onClick={handleClick}
+                              title={beat.description || undefined}
+                              type="button"
+                            >
+                              {beat.color ? (
+                                <span className="beat-color-dot" style={{ backgroundColor: beat.color }} />
+                              ) : (
+                                <span className="beat-color-dot empty" />
+                              )}
+                              <span className="beat-title-text">{beat.title || 'Untitled Beat'}</span>
+                              {linkedOk && <span className="beat-linked-indicator">Scene</span>}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                );
+              })
             )}
           </div>
         )}

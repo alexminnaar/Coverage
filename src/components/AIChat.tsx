@@ -22,13 +22,23 @@ import {
   Loader2,
 } from 'lucide-react';
 import { useAIChat } from '../hooks/useAIChat';
-import { PendingEdit, ScriptElement, ELEMENT_LABELS, ElementType } from '../types';
+import {
+  PendingEdit,
+  ScriptElement,
+  ELEMENT_LABELS,
+  ElementType,
+  Beat,
+  BeatStructure,
+  BEAT_STRUCTURES,
+} from '../types';
 import type { AIStreamEvent } from '../services/aiClient';
 
 interface AIChatProps {
   isOpen: boolean;
   onClose: () => void;
   elements: ScriptElement[];
+  beats?: Beat[];
+  beatStructure?: BeatStructure;
   currentElementId?: string | null;
   onProposeEdits: (edits: PendingEdit[]) => void;
   pendingEdits?: Map<string, PendingEdit>;
@@ -85,6 +95,8 @@ export default function AIChat({
   isOpen,
   onClose,
   elements,
+  beats,
+  beatStructure,
   currentElementId,
   onProposeEdits,
   pendingEdits,
@@ -95,13 +107,19 @@ export default function AIChat({
   onWidthChange,
   projectId,
 }: AIChatProps) {
+  // (debug instrumentation removed)
+
   const [input, setInput] = useState('');
   const [mode, setMode] = useState<'ask' | 'edit'>('ask');
+  const messagesScrollRef = useRef<HTMLDivElement>(null);
+  const isAtBottomRef = useRef<boolean>(true);
+  const forceScrollToBottomRef = useRef<boolean>(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const [showEditList, setShowEditList] = useState(false);
   const [selectionSnapshot, setSelectionSnapshot] = useState<string>('');
   const [activeTextareaElementId, setActiveTextareaElementId] = useState<string | null>(null);
+  const [includeBeats, setIncludeBeats] = useState(true);
 
   // Resize state
   const [isDragging, setIsDragging] = useState(false);
@@ -111,6 +129,44 @@ export default function AIChat({
     elements.map(el => ({ id: el.id, type: el.type, content: el.content })),
     projectId
   );
+
+  const beatContextBlock = useMemo(() => {
+    if (!includeBeats) return '';
+    const list = (beats || []).slice();
+    if (!list.length) return '';
+
+    const structure: BeatStructure = beatStructure || 'three-act';
+    const actNames = BEAT_STRUCTURES[structure] || ['Act 1', 'Act 2', 'Act 3'];
+
+    const byAct: Beat[][] = actNames.map(() => []);
+    for (const b of list) {
+      const idx = typeof b.actIndex === 'number' ? b.actIndex : -1;
+      if (idx >= 0 && idx < byAct.length) byAct[idx].push(b);
+    }
+    for (const arr of byAct) arr.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+
+    const maxPerAct = 8;
+    const maxDesc = 120;
+    const lines: string[] = [];
+    lines.push('Beat Board Context (high-level story intent):');
+    actNames.forEach((actName, actIndex) => {
+      const actBeats = byAct[actIndex] || [];
+      if (!actBeats.length) return;
+      lines.push(`ACT ${actIndex + 1}: ${actName}`);
+      actBeats.slice(0, maxPerAct).forEach((beat, i) => {
+        const title = (beat.title || 'Untitled').trim();
+        const desc = (beat.description || '').trim();
+        const descSnippet = desc.length > maxDesc ? desc.slice(0, maxDesc) + '…' : desc;
+        lines.push(`- [beatId=${beat.id}] #${i + 1} ${title}${descSnippet ? ` — ${descSnippet}` : ''}`);
+      });
+      if (actBeats.length > maxPerAct) lines.push('- … (more beats omitted)');
+      lines.push('');
+    });
+    lines.push('Use beats to ground answers and edits in story structure. If a change conflicts with beats, call it out.');
+    return lines.join('\n') + '\n\n---\n\n';
+  }, [beats, beatStructure, includeBeats]);
+
+  // (debug instrumentation removed)
 
   const pendingEditList = useMemo(() => {
     if (!pendingEdits || pendingEdits.size === 0) return [];
@@ -303,17 +359,40 @@ export default function AIChat({
     return [];
   };
 
-  const getApplyMeta = (events?: AIStreamEvent[]): { label: string; elementIds: string[] } | null => {
-    if (!events || events.length === 0) return null;
-    for (let i = events.length - 1; i >= 0; i--) {
-      const evt = events[i];
-      if (evt && evt.type === 'apply_started') {
-        const elementIds = Array.isArray((evt as any).elementIds) ? (evt as any).elementIds : [];
-        const label = (evt as any).label ? String((evt as any).label) : 'Applying edits';
-        return { label, elementIds };
+  const getElementIndex = (id: string) => elements.findIndex(el => el.id === id);
+
+  const getCharacterForDialogueIndex = (idx: number): string | null => {
+    if (idx < 0) return null;
+    for (let i = idx - 1; i >= 0 && i >= idx - 4; i--) {
+      const el = elements[i];
+      if (el?.type === 'character') {
+        const name = (el.content || '').trim();
+        return name || null;
       }
+      if (el?.type === 'scene-heading') break;
     }
     return null;
+  };
+
+  const buildEditCardTitle = (elementId: string, elementType: string, fallbackSnippet?: string) => {
+    const el = elements.find(e => e.id === elementId);
+    const type = (el?.type || elementType || 'action') as ElementType;
+    const label = ELEMENT_LABELS[type] || type;
+    const base = `Edited ${label}`;
+
+    const snippetSource = (el?.content || fallbackSnippet || '').trim();
+    const snippet = snippetSource ? formatSnippet(snippetSource) : '';
+
+    if (type === 'dialogue') {
+      const idx = getElementIndex(elementId);
+      const who = getCharacterForDialogueIndex(idx);
+      const whoBit = who ? ` (${who})` : '';
+      return snippet ? `${base}${whoBit} — ${snippet}` : `${base}${whoBit}`;
+    }
+    if (type === 'scene-heading') {
+      return snippet ? `Edited Scene — ${snippet}` : 'Edited Scene';
+    }
+    return snippet ? `${base} — ${snippet}` : base;
   };
 
   const stripProgressMarkers = (content: string): string => {
@@ -493,12 +572,12 @@ export default function AIChat({
         : '';
 
     return {
-      sceneContext: `${selectionBlock}${formatted}`,
+      sceneContext: `${beatContextBlock}${selectionBlock}${formatted}`,
       contextElementIds,
       selectedElementId,
       selectedText: selectedText || undefined,
       sceneHeadings,
-      contextCharCount: (`${selectionBlock}${formatted}`).length,
+      contextCharCount: (`${beatContextBlock}${selectionBlock}${formatted}`).length,
     };
   };
 
@@ -529,8 +608,38 @@ export default function AIChat({
 
   // Scroll to bottom when messages change
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    const el = messagesScrollRef.current;
+    if (!el) return;
+
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const isAtBottom = distanceFromBottom < 80;
+    const forceScroll = forceScrollToBottomRef.current;
+    // Cursor-like: auto-scroll if the user *was* at bottom before the update, or is currently at bottom.
+    // If the user scrolls up to review history, do not yank them down on new messages.
+    // Exception: if the user explicitly hit "Send", we should take them to the latest message.
+    const shouldScroll = forceScroll || isAtBottomRef.current || isAtBottom;
+
+    if (shouldScroll) {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      // If we intentionally scrolled, we should treat ourselves as "at bottom" for subsequent streaming tokens.
+      isAtBottomRef.current = true;
+    } else {
+      // Refresh stored "at bottom" state based on current scroll position.
+      isAtBottomRef.current = isAtBottom;
+    }
+
+    // The "Send" action should only force-scroll once.
+    if (forceScroll) {
+      forceScrollToBottomRef.current = false;
+    }
   }, [messages]);
+
+  const handleMessagesScroll = () => {
+    const el = messagesScrollRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    isAtBottomRef.current = distanceFromBottom < 80;
+  };
 
   // Focus input when opened
   useEffect(() => {
@@ -541,6 +650,7 @@ export default function AIChat({
 
   const handleSend = () => {
     if (!input.trim() || isStreaming) return;
+    forceScrollToBottomRef.current = true;
     const selectedText = getSelectionText();
     const bundle = buildScenePlusAdjacentContext(selectedText, activeTextareaElementId);
     sendMessage(input, bundle.sceneContext, mode, {
@@ -553,6 +663,7 @@ export default function AIChat({
   };
 
   const handleQuickPrompt = (prompt: string) => {
+    forceScrollToBottomRef.current = true;
     const selectedText = getSelectionText();
     const bundle = buildScenePlusAdjacentContext(selectedText, activeTextareaElementId);
     sendMessage(prompt, bundle.sceneContext, mode, {
@@ -624,7 +735,7 @@ export default function AIChat({
       </div>
 
       {/* Messages */}
-      <div className="ai-chat-messages">
+      <div className="ai-chat-messages" ref={messagesScrollRef} onScroll={handleMessagesScroll}>
         {messages.length === 0 && (
           <div className="ai-chat-welcome">
             <div className="ai-welcome-icon">
@@ -666,7 +777,6 @@ export default function AIChat({
             return progressSource ? extractProgressSteps(progressSource) : [];
           })();
           const applyingElementIds = isStreamingEdit ? getApplyingElementIds(msg.events) : [];
-          const applyMeta = mode === 'edit' ? getApplyMeta(msg.events) : null;
           
           // Get all elements being edited - from completed edits or detected during streaming
           const completedEditElements = hasEdits && msg.edits
@@ -711,13 +821,8 @@ export default function AIChat({
           let displayContent = '';
 
           if (hasEdits && msg.edits && msg.edits.length > 0) {
-            // Show reasons from edits (preferred)
-            const reasons = msg.edits
-              .map(e => e.reason)
-              .filter((r): r is string => !!r);
-            if (reasons.length > 0) {
-              displayContent = reasons.join('\n\n');
-            }
+            // Prefer per-element reasons rendered below each edit card (Cursor-like).
+            displayContent = '';
           } else if (isStreamingEdit || isStreamingAsk) {
             // While streaming (edit/ask), prefer the progress stack (Cursor-like)
             // and avoid duplicating verbose intermediate text in the body.
@@ -758,45 +863,39 @@ export default function AIChat({
                 )}
 
                 {/* Apply-phase pill (Cursor-like): show only for the most recent edit run (Cursor doesn't keep old pills around) */}
-                {mode === 'edit' && isLastMessage && applyMeta && (isStreamingEdit || hasEdits) && (
+                {/* Per-message edit cards (do NOT hide old ones when a new user message is sent) */}
+                {mode === 'edit' && (isStreamingEdit || hasEdits) && allEditElements.length > 0 && (
                   <div className="ai-edit-loading-container">
-                    <div
-                      className={`ai-edit-loading ${hasEdits ? 'ai-edit-complete' : ''} ${hasEdits && msg.edits?.[0]?.elementId ? 'ai-edit-clickable' : ''}`}
-                      onClick={hasEdits && msg.edits?.[0]?.elementId ? () => handleJumpToEdit(msg.edits![0].elementId) : undefined}
-                      style={hasEdits && msg.edits?.[0]?.elementId ? { cursor: 'pointer' } : undefined}
-                      title={hasEdits && msg.edits?.[0]?.elementId ? 'Click to jump to first edit' : undefined}
-                    >
-                      {hasEdits ? (
-                        <Check size={14} className="ai-edit-complete-icon" />
-                      ) : (
-                        <Loader2 size={14} className="ai-edit-loading-spinner" />
-                      )}
-                      <span>{hasEdits ? 'Edited Dialogue' : applyMeta.label}</span>
-                    </div>
-                  </div>
-                )}
-
-                {/* Fallback (no apply_started events): show per-element pills (also only for most recent run) */}
-                {mode === 'edit' && isLastMessage && !applyMeta && allEditElements.length > 0 && (
-                  <div className="ai-edit-loading-container">
-                    {allEditElements.map(({ elementId, elementType, isComplete }) => (
-                      <div
-                        key={elementId}
-                        className={`ai-edit-loading ${isComplete ? 'ai-edit-complete' : ''} ${isComplete ? 'ai-edit-clickable' : ''}`}
-                        onClick={isComplete ? () => handleJumpToEdit(elementId) : undefined}
-                        style={isComplete ? { cursor: 'pointer' } : undefined}
-                        title={isComplete ? 'Click to jump to edit' : undefined}
-                      >
-                        {isComplete ? (
-                          <Check size={14} className="ai-edit-complete-icon" />
-                        ) : (
-                          <Loader2 size={14} className="ai-edit-loading-spinner" />
-                        )}
-                        <span>
-                          {isComplete ? 'Edited' : 'Editing'} {ELEMENT_LABELS[elementType as ElementType] || elementType}
-                        </span>
-                      </div>
-                    ))}
+                    {allEditElements
+                      .slice()
+                      .sort((a, b) => (getElementIndex(a.elementId) - getElementIndex(b.elementId)))
+                      .map(({ elementId, elementType, isComplete }) => {
+                        const edit = msg.edits?.find(e => e.elementId === elementId);
+                        const title = buildEditCardTitle(elementId, elementType, edit?.newContent || edit?.originalContent);
+                        return (
+                          <div key={elementId} className="ai-edit-item">
+                            <div
+                              className={`ai-edit-loading ${isComplete ? 'ai-edit-complete' : ''} ${isComplete ? 'ai-edit-clickable' : ''}`}
+                              onClick={isComplete ? () => handleJumpToEdit(elementId) : undefined}
+                              style={isComplete ? { cursor: 'pointer' } : undefined}
+                              title={isComplete ? 'Click to jump to edit' : undefined}
+                            >
+                              {isComplete ? (
+                                <Check size={14} className="ai-edit-complete-icon" />
+                              ) : (
+                                <Loader2 size={14} className="ai-edit-loading-spinner" />
+                              )}
+                              <span>{title}</span>
+                            </div>
+                            {isComplete && edit?.reason && (
+                              <div
+                                className="ai-edit-item-reason"
+                                dangerouslySetInnerHTML={{ __html: marked.parse(edit.reason) as string }}
+                              />
+                            )}
+                          </div>
+                        );
+                      })}
                   </div>
                 )}
 
@@ -836,6 +935,18 @@ export default function AIChat({
           <div className="ai-context-chip">
             <div className="ai-context-line">{selectionLabel}</div>
           </div>
+          {(beats?.length || 0) > 0 && (
+            <button
+              type="button"
+              className="ai-context-btn"
+              onClick={() => setIncludeBeats(v => !v)}
+              title={includeBeats ? 'Beats are included in AI context' : 'Beats are excluded from AI context'}
+            >
+              <span style={{ fontSize: 12, opacity: 0.9 }}>
+                Beats: {includeBeats ? 'On' : 'Off'}
+              </span>
+            </button>
+          )}
         </div>
 
         {pendingEditList.length > 0 && (

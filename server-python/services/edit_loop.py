@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from services.edit_types import EditGraphDeps, EditResponse
+from services.prompts import PROMPT_CONTEXT_CONTRACT
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +61,9 @@ class EditLoopState:
     verification_issues: list[str] = field(default_factory=list)
 
     apply_started_emitted: bool = False
+
+    # Context extraction window for DB extraction; increased on recovery attempts
+    context_size: int = 3
 
     iterations: int = 0
     locate_attempts: int = 0
@@ -128,6 +133,23 @@ def _looks_like_verify_failure(text: str) -> bool:
     )
 
 
+def _env_flag(name: str, default: bool = True) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _safe_json_dict(text: str) -> Dict[str, Any]:
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    return {}
+
+
 async def run_edit_loop(
     llm_service: Any,
     *,
@@ -141,7 +163,14 @@ async def run_edit_loop(
     The loop emits typed events via `emit(...)`.
     """
     budgets = budgets or EditLoopBudgets()
+    verify_recover_enabled = _env_flag("EDIT_VERIFY_RECOVER", True)
+    logger.info(
+        f"[edit_loop] start project_id={getattr(deps,'project_id',None)} "
+        f"prompt={state.user_prompt[:160]!r} iter_max={budgets.max_iterations}"
+    )
     await emit({"type": "status", "message": "[Start] Starting edit"})
+    if getattr(deps, "global_index", None):
+        await emit({"type": "status", "message": "[Index] Using global scene/character index"})
 
     while state.iterations < budgets.max_iterations:
         state.iterations += 1
@@ -149,11 +178,33 @@ async def run_edit_loop(
         # ROUTE
         if state.intent is None:
             await emit({"type": "decision", "action": "plan_intent", "why": "intent is not set"})
-            selection = f"\n\nSelected text:\n{state.selected_text}" if state.selected_text else ""
-            prompt = f"User request: {state.user_prompt}{selection}\n\nContext window:\n{deps.scene_context}"
+            selection_bits = []
+            if state.selected_text:
+                selection_bits.append(f"Selected text:\n{state.selected_text}")
+            if state.selected_element_id:
+                selection_bits.append(f"Selected element ID: {state.selected_element_id}")
+            selection_block = ("\n\n".join(selection_bits) + "\n") if selection_bits else ""
+
+            global_bits = f"{deps.global_index}\n" if getattr(deps, "global_index", None) else ""
+            ctx_bits = deps.scene_context or ""
+
+            prompt = (
+                f"{PROMPT_CONTEXT_CONTRACT}\n\n"
+                "## User request\n"
+                f"{state.user_prompt}\n\n"
+                + ("## Selection (UI anchor)\n" + selection_block + "\n" if selection_block else "")
+                + ("## Global index\n" + global_bits + "\n" if global_bits else "")
+                + "## Scene context (verbatim, local excerpt)\n"
+                + "BEGIN_SCENE_CONTEXT\n"
+                + ctx_bits
+                + "\nEND_SCENE_CONTEXT\n"
+            )
+            await emit({"type": "tool_call", "tool": "llm.plan_intent", "prompt": prompt[:4000]})
             result = await llm_service.plan_intent_agent.run(prompt, deps=deps)
             out = get_result_output(result)
             state.intent = out
+            logger.info(f"[edit_loop] planned_intent len={len(out)} preview={out[:120]!r}")
+            await emit({"type": "tool_result", "tool": "llm.plan_intent", "intent_preview": out[:800]})
             await emit({"type": "status", "message": f"[Planning] {out[:120]}..."})
             continue
 
@@ -174,8 +225,24 @@ async def run_edit_loop(
                 + ("Extract broad search terms." if broaden else "Extract search terms.")
                 + "\nReturn a JSON array of strings."
             )
+            await emit(
+                {
+                    "type": "tool_call",
+                    "tool": "llm.extract_search_terms",
+                    "prompt": terms_prompt[:2000],
+                    "attempt": state.locate_attempts,
+                }
+            )
             terms_result = await llm_service.extract_search_terms_agent.run(terms_prompt, deps=deps)
             state.search_terms = _extract_search_terms(get_result_output(terms_result))
+            await emit(
+                {
+                    "type": "tool_result",
+                    "tool": "llm.extract_search_terms",
+                    "terms_count": len(state.search_terms),
+                    "terms_preview": state.search_terms[:12],
+                }
+            )
 
             # 2) try vector retrieval first (best-effort), then keyword DB
             element_ids: list[str] = []
@@ -195,7 +262,14 @@ async def run_edit_loop(
                     top_k=12 if not broaden else 25,
                     element_types=["dialogue", "character", "action", "scene-heading"],
                 )
-                await emit({"type": "tool_result", "tool": "vec_search", "count": len(element_ids)})
+                await emit(
+                    {
+                        "type": "tool_result",
+                        "tool": "vec_search",
+                        "count": len(element_ids),
+                        "ids_preview": element_ids[:10],
+                    }
+                )
 
                 if not element_ids:
                     await emit(
@@ -211,7 +285,14 @@ async def run_edit_loop(
                         state.search_terms,
                         element_types=["dialogue", "character", "action", "scene-heading"],
                     )
-                    await emit({"type": "tool_result", "tool": "db_search", "count": len(element_ids)})
+                    await emit(
+                        {
+                            "type": "tool_result",
+                            "tool": "db_search",
+                            "count": len(element_ids),
+                            "ids_preview": element_ids[:10],
+                        }
+                    )
                 if element_ids:
                     state.relevant_element_ids = element_ids
                     await emit({"type": "status", "message": f"[Locating] Found {len(element_ids)} relevant elements via retrieval"})
@@ -226,9 +307,19 @@ async def run_edit_loop(
                     "Only return IDs that appear in the window.\n\n"
                     f"Context window:\n{deps.scene_context}"
                 )
+                await emit({"type": "tool_call", "tool": "llm.locate_fallback", "prompt": locate_prompt[:4000]})
                 locate_result = await llm_service.locate_scenes_agent.run(locate_prompt, deps=deps)
                 locate_text = get_result_output(locate_result)
                 ids = UUID_RE.findall(locate_text)
+                await emit(
+                    {
+                        "type": "tool_result",
+                        "tool": "llm.locate_fallback",
+                        "ids_count": len(ids),
+                        "ids_preview": ids[:10],
+                        "raw_preview": locate_text[:800],
+                    }
+                )
                 if not ids and state.context_element_ids:
                     # Last resort: give the loop *something* to work with; refine/propose steps can narrow.
                     ids = list(state.context_element_ids)[:20]
@@ -249,15 +340,31 @@ async def run_edit_loop(
             await emit({"type": "decision", "action": "load_context", "why": "context not loaded"})
 
             if deps.project_id and deps.db_pool and state.relevant_element_ids:
-                await emit({"type": "tool_call", "tool": "db_extract_context", "count": len(state.relevant_element_ids)})
+                await emit(
+                    {
+                        "type": "tool_call",
+                        "tool": "db_extract_context",
+                        "count": len(state.relevant_element_ids),
+                        "element_ids_preview": state.relevant_element_ids[:10],
+                    }
+                )
                 context, error_msg = await llm_service._extract_element_context(
                     deps.project_id,
                     state.relevant_element_ids[:20],
-                    context_size=3,
+                    context_size=state.context_size,
                 )
                 if context:
                     state.loaded_context = context
-                    await emit({"type": "tool_result", "tool": "db_extract_context", "ok": True})
+                    await emit(
+                        {
+                            "type": "tool_result",
+                            "tool": "db_extract_context",
+                            "ok": True,
+                            "element_ids_preview": state.relevant_element_ids[:10],
+                            "context_len": len(context),
+                            "context_preview": context[:800],
+                        }
+                    )
                     await emit(
                         {
                             "type": "status",
@@ -271,14 +378,24 @@ async def run_edit_loop(
                         "tool": "db_extract_context",
                         "ok": False,
                         "error": error_msg or "no rows",
+                        "element_ids_preview": state.relevant_element_ids[:10],
                     }
                 )
                 await emit({"type": "status", "message": "[Loading Context] ⚠️ Database extraction failed, using LLM fallback"})
 
             ids_str = ", ".join(state.relevant_element_ids[:10])
             prompt = f"Extract context for these element IDs: {ids_str}\n\nFull screenplay:\n{deps.scene_context}"
+            await emit({"type": "tool_call", "tool": "llm.load_context_fallback", "prompt": prompt[:4000]})
             result = await llm_service.load_context_agent.run(prompt, deps=deps)
             state.loaded_context = get_result_output(result)
+            await emit(
+                {
+                    "type": "tool_result",
+                    "tool": "llm.load_context_fallback",
+                    "context_len": len(state.loaded_context or ""),
+                    "context_preview": (state.loaded_context or "")[:800],
+                }
+            )
             await emit({"type": "status", "message": "[Loading Context] Extracted context via LLM"})
             continue
 
@@ -290,8 +407,10 @@ Relevant Context: {state.loaded_context}
 Context window: {deps.scene_context}
 
 Synthesize a comprehensive understanding of what needs to change."""
+            await emit({"type": "tool_call", "tool": "llm.synthesize", "prompt": prompt[:4000]})
             result = await llm_service.synthesize_agent.run(prompt, deps=deps)
             state.understanding = get_result_output(result)
+            await emit({"type": "tool_result", "tool": "llm.synthesize", "understanding_preview": (state.understanding or "")[:800]})
             await emit({"type": "status", "message": "[Synthesizing] Understanding complete"})
             continue
 
@@ -303,9 +422,19 @@ Relevant Context: {state.loaded_context}
 Context window: {deps.scene_context}
 
 Generate specific edit proposals."""
+            await emit({"type": "tool_call", "tool": "llm.propose_edits", "prompt": prompt[:4000]})
             result = await llm_service.propose_edits_agent.run(prompt, deps=deps)
             edits = _coerce_edit_response(getattr(result, "data", None) if hasattr(result, "data") else result)
             state.proposed_edits = edits or {"edits": []}
+            logger.info(f"[edit_loop] proposed_edits n={len((state.proposed_edits or {}).get('edits', []))}")
+            await emit(
+                {
+                    "type": "tool_result",
+                    "tool": "llm.propose_edits",
+                    "edits_count": len((state.proposed_edits or {}).get("edits", [])),
+                    "edits_preview": (state.proposed_edits or {}).get("edits", [])[:3],
+                }
+            )
             await emit({"type": "status", "message": "[Proposing] Generated edit proposals"})
             continue
 
@@ -322,7 +451,15 @@ Generate specific edit proposals."""
             # Emit apply_started here so the UI shows the \"Edit Dialogue\" pill during refinement+verification.
             if not state.apply_started_emitted:
                 state.apply_started_emitted = True
-                await emit({"type": "apply_started", "elementIds": [], "label": "Edit Dialogue"})
+                try:
+                    element_ids = [
+                        str(e.get("elementId"))
+                        for e in (state.proposed_edits or {}).get("edits", [])
+                        if isinstance(e, dict) and e.get("elementId")
+                    ]
+                except Exception:
+                    element_ids = []
+                await emit({"type": "apply_started", "elementIds": element_ids, "label": "Applying edits"})
             issues = "\n".join(f"- {x}" for x in state.verification_issues) if state.verification_issues else "None"
             edits_json = json.dumps(state.proposed_edits or {"edits": []})
             selection = f"\nSelected text:\n{state.selected_text}\n" if state.selected_text else ""
@@ -331,9 +468,21 @@ Context window: {deps.scene_context}
 Known issues:\n{issues}
 
 Validate and refine these edits."""
+            await emit({"type": "tool_call", "tool": "llm.refine_edits", "prompt": prompt[:4000], "attempt": state.refine_attempts})
             result = await llm_service.refine_edits_agent.run(prompt, deps=deps)
             edits = _coerce_edit_response(getattr(result, "data", None) if hasattr(result, "data") else result)
             state.applied_edits = edits or (state.proposed_edits or {"edits": []})
+            logger.info(
+                f"[edit_loop] refined_edits attempt={state.refine_attempts} n={len((state.applied_edits or {}).get('edits', []))}"
+            )
+            await emit(
+                {
+                    "type": "tool_result",
+                    "tool": "llm.refine_edits",
+                    "edits_count": len((state.applied_edits or {}).get("edits", [])),
+                    "edits_preview": (state.applied_edits or {}).get("edits", [])[:3],
+                }
+            )
             await emit({"type": "status", "message": "[Refining] Edits validated and refined"})
             continue
 
@@ -351,6 +500,22 @@ Validate and refine these edits."""
                 if e.get("newContent", "") == "":
                     state.verification_issues.append(f"Edit for {e.get('elementId', '<unknown>')} has empty newContent")
 
+            # Ensure element IDs are grounded in the current context window / retrieved candidates.
+            allowed_ids: set[str] = set()
+            try:
+                allowed_ids.update([str(x) for x in (state.context_element_ids or []) if x])
+            except Exception:
+                pass
+            try:
+                allowed_ids.update([str(x) for x in (state.relevant_element_ids or []) if x])
+            except Exception:
+                pass
+            if allowed_ids:
+                for e in applied.get("edits", []):
+                    eid = e.get("elementId")
+                    if eid and str(eid) not in allowed_ids:
+                        state.verification_issues.append(f"Edit elementId not in context: {eid}")
+
             # DB verify IDs if available
             if deps.project_id and deps.db_pool:
                 element_ids = [e.get("elementId") for e in applied.get("edits", []) if e.get("elementId")]
@@ -360,33 +525,134 @@ Validate and refine these edits."""
                     if invalid:
                         state.verification_issues.append(f"Invalid element IDs: {', '.join(invalid)}")
 
-            # Agent verify (adds formatting/continuity checks)
-            edits_json = json.dumps(applied)
-            selection = f"\nSelected text:\n{state.selected_text}\n" if state.selected_text else ""
-            prompt = f"""Applied edits: {edits_json}{selection}
+            # Agent verify (Cursor-like): structured issues + recovery strategy, only triggers recovery on failure.
+            verifier_ok = True
+            suggested_recovery = "revise_edits"
+
+            if verify_recover_enabled and hasattr(llm_service, "edit_verify_structured_agent"):
+                payload = json.dumps(
+                    {
+                        "userRequest": state.user_prompt,
+                        "selectedText": state.selected_text,
+                        "globalIndex": getattr(deps, "global_index", None),
+                        "contextWindow": deps.scene_context,
+                        "appliedEdits": applied,
+                        "precheckIssues": state.verification_issues,
+                    }
+                )
+                await emit({"type": "tool_call", "tool": "llm.verify_structured", "payload": payload[:4000], "attempt": state.verify_attempts})
+                result = await llm_service.edit_verify_structured_agent.run(payload, deps=deps)
+                verify_obj = _safe_json_dict(get_result_output(result))
+                await emit({"type": "tool_result", "tool": "llm.verify_structured", "verify": verify_obj})
+                verifier_ok = bool(verify_obj.get("ok", True))
+                suggested_recovery = str(verify_obj.get("suggested_recovery", "revise_edits"))
+                logger.info(
+                    f"[edit_loop] verify_structured attempt={state.verify_attempts} ok={verifier_ok} "
+                    f"recovery={suggested_recovery!r} issues_n={len(verify_obj.get('issues') or []) if isinstance(verify_obj, dict) else 0}"
+                )
+
+                issues = verify_obj.get("issues")
+                if isinstance(issues, list):
+                    for it in issues[:12]:
+                        if not isinstance(it, dict):
+                            continue
+                        code = it.get("code", "VERIFY_ISSUE")
+                        msg = it.get("message", "")
+                        sev = it.get("severity", "error")
+                        state.verification_issues.append(f"{sev}:{code}:{msg}")
+
+                state.verification_result = json.dumps(verify_obj) if verify_obj else None
+            else:
+                # Fallback: legacy freeform verifier
+                edits_json = json.dumps(applied)
+                selection = f"\nSelected text:\n{state.selected_text}\n" if state.selected_text else ""
+                prompt = f"""Applied edits: {edits_json}{selection}
 Context window: {deps.scene_context}
 Pre-check issues: {state.verification_issues if state.verification_issues else 'None'}
 
 Verify continuity and formatting."""
-            result = await llm_service.verify_agent.run(prompt, deps=deps)
-            verify_text = get_result_output(result)
-            state.verification_result = verify_text
+                await emit({"type": "tool_call", "tool": "llm.verify_freeform", "prompt": prompt[:4000], "attempt": state.verify_attempts})
+                result = await llm_service.verify_agent.run(prompt, deps=deps)
+                verify_text = get_result_output(result)
+                state.verification_result = verify_text
+                await emit({"type": "tool_result", "tool": "llm.verify_freeform", "verify_preview": (verify_text or "")[:1200]})
+                verifier_ok = not _looks_like_verify_failure(verify_text)
+                if (not verifier_ok) and verify_text and len(verify_text) < 800:
+                    state.verification_issues.append(verify_text)
 
-            if state.verification_issues or _looks_like_verify_failure(verify_text):
-                await emit({"type": "status", "message": "[Verifying] Issues found, retrying refinement"})
+            if state.verification_issues or (not verifier_ok):
+                await emit({"type": "status", "message": "[Verifying] Issues found"})
+
+                if not verify_recover_enabled:
+                    # Old behavior: retry refinement
+                    await emit(
+                        {
+                            "type": "decision",
+                            "action": "backtrack_to_refine",
+                            "why": "verification issues detected",
+                        }
+                    )
+                    state.applied_edits = None
+                    continue
+
+                # Recovery playbook (only on verification failure)
                 await emit(
                     {
                         "type": "decision",
-                        "action": "backtrack_to_refine",
-                        "why": "verification issues detected",
+                        "action": "recover",
+                        "why": "verification_failed",
+                        "strategy": suggested_recovery,
                     }
                 )
-                # carry forward verify text as an issue so refine can correct
-                if verify_text and len(verify_text) < 800:
-                    state.verification_issues.append(verify_text)
-                # allow refinement again if budget permits
-                state.applied_edits = None
-                continue
+
+                if suggested_recovery == "relocate":
+                    state.relevant_element_ids = []
+                    state.loaded_context = None
+                    state.understanding = None
+                    state.proposed_edits = None
+                    state.applied_edits = None
+                    state.context_size = min(state.context_size + 2, 8)
+                    continue
+
+                if suggested_recovery == "reload_context":
+                    state.loaded_context = None
+                    state.understanding = None
+                    state.proposed_edits = None
+                    state.applied_edits = None
+                    state.context_size = min(state.context_size + 2, 8)
+                    continue
+
+                if suggested_recovery == "revise_edits" and hasattr(llm_service, "edit_revise_edits_agent"):
+                    revise_payload = json.dumps(
+                        {
+                            "userRequest": state.user_prompt,
+                            "selectedText": state.selected_text,
+                            "contextWindow": deps.scene_context,
+                            "appliedEdits": applied,
+                            "issues": state.verification_issues,
+                        }
+                    )
+                    await emit({"type": "tool_call", "tool": "llm.revise_edits", "payload": revise_payload[:4000]})
+                    revise_result = await llm_service.edit_revise_edits_agent.run(revise_payload, deps=deps)
+                    revised = _coerce_edit_response(
+                        getattr(revise_result, "data", None) if hasattr(revise_result, "data") else revise_result
+                    )
+                    state.applied_edits = revised or applied
+                    await emit(
+                        {
+                            "type": "tool_result",
+                            "tool": "llm.revise_edits",
+                            "edits_count": len((state.applied_edits or {}).get("edits", [])),
+                            "edits_preview": (state.applied_edits or {}).get("edits", [])[:3],
+                        }
+                    )
+                    continue
+
+                # abort
+                await emit({"type": "status", "message": "[Verifying] Cannot safely apply edits; aborting"})
+                await emit({"type": "apply_done"})
+                logger.info("[edit_loop] abort: returning empty edits")
+                return {"edits": []}
 
             await emit({"type": "status", "message": "[Verifying] Continuity check complete"})
 
@@ -394,6 +660,7 @@ Verify continuity and formatting."""
         await emit({"type": "apply_done"})
 
         # FINISH
+        logger.info(f"[edit_loop] finish edits_n={len((state.applied_edits or {}).get('edits', []))}")
         return state.applied_edits or {"edits": []}
 
     # Budget exceeded: return empty edits with a clear status

@@ -63,5 +63,6 @@ class EditGraphDeps:
     message_history: List[ModelMessage]
     project_id: Optional[str] = None  # UUID of the screenplay project
     db_pool: Optional[object] = None  # PostgreSQL connection pool
+    global_index: Optional[str] = None
 
 

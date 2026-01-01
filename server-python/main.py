@@ -14,6 +14,7 @@ from models import (
     CommandResponse
 )
 from services.llm_service import llm_service
+from services.observability.langfuse_client import langfuse_client
 
 # Load environment variables
 load_dotenv()
@@ -121,10 +122,33 @@ async def stream_chat(request: ChatRequest):
     messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
 
     async def generate():
+        trace_ctx = None
+        final_summary = None
         try:
+            trace_ctx = langfuse_client.start_trace(
+                name=f"chat.{request.mode or 'ask'}",
+                metadata={
+                    "projectId": request.projectId,
+                    "mode": request.mode or "ask",
+                    "streamEvents": request.streamEvents,
+                    "contextPolicy": request.contextPolicy,
+                    "hasGlobalIndex": bool(request.globalIndex),
+                    "selectedElementId": request.selectedElementId,
+                    "selectedTextLen": len(request.selectedText or ""),
+                    "sceneContextLen": len(request.sceneContext or ""),
+                    "globalIndexLen": len(request.globalIndex or ""),
+                },
+                input={
+                    "messages": messages,
+                    "sceneContext": request.sceneContext,
+                    "globalIndex": request.globalIndex,
+                },
+                tags=["ai-service", "chat"],
+            )
             async for chunk in llm_service.stream_chat(
                 messages,
                 request.sceneContext,
+                request.globalIndex,
                 request.mode or 'ask',
                 request.projectId,
                 request.streamEvents,
@@ -132,11 +156,21 @@ async def stream_chat(request: ChatRequest):
                 request.selectedText,
                 request.contextPolicy,
                 request.contextElementIds,
+                trace_ctx=trace_ctx,
             ):
                 yield f"data: {json.dumps({'content': chunk})}\n\n"
+                # Best-effort store final output (typed events contain final payload)
+                if isinstance(chunk, str) and '"type": "final"' in chunk:
+                    final_summary = chunk[-4000:]
             yield "data: [DONE]\n\n"
         except Exception as stream_error:
+            langfuse_client.end_trace(trace_ctx, output={"error": str(stream_error), "final": final_summary})
+            langfuse_client.flush()
             yield f"data: {json.dumps({'error': str(stream_error)})}\n\n"
+        finally:
+            if trace_ctx:
+                langfuse_client.end_trace(trace_ctx, output={"final": final_summary})
+                langfuse_client.flush()
 
     return StreamingResponse(
         generate(),

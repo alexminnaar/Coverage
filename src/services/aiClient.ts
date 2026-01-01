@@ -117,6 +117,7 @@ export async function* streamChat(
     selectedText?: string | null;
     contextPolicy?: 'scene_plus_adjacent' | 'full';
     contextElementIds?: string[];
+    globalIndex?: string;
   }
 ): AsyncGenerator<string> {
   // Typed streaming events are now the default for both ask + edit (Cursor-like).
@@ -135,6 +136,7 @@ export async function* streamChat(
       selectedText: requestMeta?.selectedText ?? undefined,
       contextPolicy: requestMeta?.contextPolicy ?? undefined,
       contextElementIds: requestMeta?.contextElementIds ?? undefined,
+      globalIndex: requestMeta?.globalIndex ?? undefined,
     }),
     signal,
   });

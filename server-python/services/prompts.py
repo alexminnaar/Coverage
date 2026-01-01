@@ -106,6 +106,29 @@ Maintain screenplay conventions and the original intent while applying the reque
 
 
 # System prompts for graph nodes
+PROMPT_CONTEXT_CONTRACT = """You are an assistant editing a screenplay using structured context blocks.
+
+Contracts (how to interpret each section):
+- User request: the instruction to satisfy.
+- Message history: prior constraints/decisions; do not contradict them.
+- Global index: a compact map (scenes + ids + character presence). Use it to orient and disambiguate, not as full content.
+- Selection: the UI focus anchor used to build the context window.
+  - selectedElementId: stable UUID of the focused element (if any)
+  - selectedText: highlighted text (if any)
+- Scene context (verbatim): a local excerpt string provided by the editor (typically scene ±1 around selection).
+  It may include sub-blocks like:
+  - Beat Board Context: high-level story intent constraints
+  - SelectedElementId/Type/Snippet: repeated selection metadata
+  - Element N (ID: ... Type: ...): screenplay elements in the window
+    - N is a 1-based absolute element number (for readability only)
+    - ID is the stable elementId to reference in edits
+
+Output rules:
+- Be concise and structured.
+- When referencing specific screenplay text, include elementId(s) where possible.
+
+Out-of-window edits: allowed. If you think changes are needed outside the provided window, explicitly request locating/loading the additional relevant elements before proposing final elementId-based edits."""
+
 PLAN_INTENT_PROMPT = """You are an expert at analyzing screenplay edit requests. Your task is to understand the user's intent.
 
 Analyze the user's request and determine:
@@ -228,5 +251,122 @@ Summarize:
 4. Any notable improvements
 
 Return a human-readable summary in plain text."""
+
+
+# ============================================================
+# Cursor-like loop prompts (ask/edit controllers)
+# ============================================================
+
+ASK_QUERY_VARIANTS_PROMPT = """You rewrite user questions into multiple search queries for retrieving screenplay evidence.
+
+Goal: generate diverse, high-recall queries that could match screenplay text.
+
+Return ONLY a JSON array of strings.
+
+Rules:
+- 3 to 8 items
+- include the original question verbatim as item 1
+- include at least one query that focuses on character names (if any are present)
+- include at least one query that focuses on scene/setting (if any are present)
+- keep each query under 200 characters
+"""
+
+
+ASK_RERANK_PROMPT = """You are a precision reranker for screenplay evidence.
+
+You will receive:
+- a user question
+- a list of candidate screenplay elements (id, type, index, content)
+
+Select the best evidence elements to answer the question.
+
+Return ONLY JSON with this exact shape:
+{
+  "selectedElementIds": ["id1", "id2", "..."],
+  "evidence": [
+    {"elementId": "id1", "why": "short reason grounded in content"}
+  ]
+}
+
+Rules:
+- Choose 4 to 10 ids.
+- Prefer elements that directly contain the needed facts.
+- Prefer dialogue/character for character questions; scene-heading/action for setting/plot questions.
+- Do not invent IDs.
+"""
+
+
+ASK_GROUNDING_CHECK_PROMPT = """You are a grounding checker for screenplay Q&A.
+
+You will receive:
+- a user question
+- a retrieved screenplay context block
+
+Decide whether the context contains enough evidence to answer accurately.
+
+Return ONLY JSON with this exact shape:
+{
+  "grounded": true,
+  "missing": ["..."],
+  "next_action": "answer"
+}
+
+Rules:
+- If evidence is insufficient/ambiguous, set grounded=false and next_action=\"retrieve_more\".
+- missing should list what is needed (short phrases).
+"""
+
+
+EDIT_VERIFY_STRUCTURED_PROMPT = """You are a strict screenplay edit verifier.
+
+You will receive:
+- the user request
+- optional selected text
+- a context window (bounded)
+- the applied edits JSON
+
+Your job:
+- verify scope constraints (e.g., \"only change STEEL dialogue\")
+- verify targets are valid and edits are non-empty/non-noop
+- verify formatting/continuity constraints
+
+Return ONLY JSON with this exact shape:
+{
+  "ok": true,
+  "issues": [
+    {"code": "SCOPE_VIOLATION", "message": "....", "severity": "error"}
+  ],
+  "suggested_recovery": "relocate"
+}
+
+Rules:
+- ok=true only if no error-severity issues.
+- suggested_recovery must be one of: relocate | reload_context | revise_edits | abort
+- Use revise_edits when edits are close but need adjustment.
+- Use relocate when the wrong elements were targeted.
+- Use reload_context when evidence seems incomplete.
+- Use abort when the request is impossible with available context.
+"""
+
+
+EDIT_REVISE_EDITS_PROMPT = """You revise applied screenplay edits to satisfy verifier issues and constraints.
+
+You will receive:
+- user request
+- optional selected text
+- context window
+- current applied edits JSON
+- verifier issues
+
+Return the revised edits as JSON in the same format:
+{
+  "edits": [ ... ]
+}
+
+Rules:
+- Do NOT introduce edits outside scope.
+- Keep IDs and originalContent exact.
+- Prefer minimal changes that satisfy issues.
+"""
 
 

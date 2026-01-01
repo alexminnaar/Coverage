@@ -231,6 +231,57 @@ class DBService:
         if not self.pool:
             return []
 
+    async def fetch_elements_by_ids(
+        self,
+        project_id: str,
+        element_ids: List[str],
+    ) -> List[Dict[str, object]]:
+        """Fetch specific screenplay elements by ID.
+
+        Returns list of dicts:
+        - element_id (str)
+        - element_type (str)
+        - element_index (int)
+        - content (str)
+        """
+        await self.ensure_pool()
+        if not self.pool:
+            return []
+        if not element_ids:
+            return []
+
+        try:
+            query = """
+                WITH indexed_elements AS (
+                    SELECT 
+                        elem->>'id' AS element_id,
+                        elem->>'type' AS element_type,
+                        (ordinality - 1)::int AS element_index,
+                        elem->>'content' AS content
+                    FROM projects p,
+                         LATERAL jsonb_array_elements(p.data->'elements') WITH ORDINALITY t(elem, ordinality)
+                    WHERE p.id = $1::uuid
+                )
+                SELECT element_id, element_type, element_index, content
+                FROM indexed_elements
+                WHERE element_id = ANY($2::text[])
+            """
+            rows = await self.pool.fetch(query, project_id, element_ids)
+            # Preserve input order
+            by_id: Dict[str, Dict[str, object]] = {
+                str(r["element_id"]): {
+                    "element_id": r["element_id"],
+                    "element_type": r["element_type"],
+                    "element_index": r["element_index"],
+                    "content": r["content"] or "",
+                }
+                for r in rows
+            }
+            return [by_id[eid] for eid in element_ids if eid in by_id]
+        except Exception as e:
+            logger.error(f"[DB Elements] ❌ Error fetching elements by ids: {type(e).__name__}: {e}")
+            return []
+
         try:
             query = """
                 WITH indexed_elements AS (
