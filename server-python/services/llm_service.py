@@ -13,7 +13,6 @@ from openai import AsyncOpenAI
 from dotenv import load_dotenv
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import ModelMessage
-from pydantic_graph import End
 import asyncpg
 
 from services.prompts import (
@@ -33,12 +32,20 @@ from services.prompts import (
     ASK_QUERY_VARIANTS_PROMPT,
     ASK_RERANK_PROMPT,
     ASK_GROUNDING_CHECK_PROMPT,
+    ASK_PLAN_PROMPT,
     EDIT_VERIFY_STRUCTURED_PROMPT,
     EDIT_REVISE_EDITS_PROMPT,
 )
 from services.db_service import DBService
-from services.edit_types import ChatDeps, EditGraphDeps, EditGraphState, EditResponse
-from services.edit_graph import build_edit_graph
+from services.edit_types import (
+    ChatDeps,
+    EditGraphDeps,
+    EditResponse,
+    AskPlanResponse,
+    AskRerankResponse,
+    AskGroundingResponse,
+    PlanIntentResponse,
+)
 from services.edit_loop import EditLoopState, run_edit_loop
 from services.ask_loop import AskLoopState, run_ask_loop
 from services.streaming import format_buffer_item, format_final_payload
@@ -76,6 +83,95 @@ class LLMService:
         self.embedding_service: Optional[EmbeddingService] = None
         if self.openai is not None:
             self.embedding_service = EmbeddingService(openai=self.openai, db=self.db, config=EmbeddingConfig())
+        # Track on-demand embedding backfills so we don't schedule duplicates.
+        self._embed_backfill_inflight: set[str] = set()
+        self._embed_backfill_last_started: Dict[str, float] = {}
+
+    async def _maybe_trigger_embed_backfill(self, project_id: str) -> None:
+        """Kick off a background embedding backfill when embeddings are missing or stale."""
+        if not self.embedding_service:
+            return
+        auto = os.getenv("EMBED_AUTO_ON_DEMAND", "1").strip().lower() not in ("0", "false", "no", "off")
+        if not auto:
+            return
+        if not project_id:
+            return
+        # Guard against duplicates.
+        if project_id in self._embed_backfill_inflight:
+            return
+        # Cooldown to avoid thrashing on repeated requests.
+        min_interval_s = int(os.getenv("EMBED_AUTO_MIN_INTERVAL_SECONDS", "60"))
+        now = time.time()
+        last = float(self._embed_backfill_last_started.get(project_id) or 0.0)
+        if (now - last) < min_interval_s:
+            return
+
+        # Check whether embeddings exist and whether they're stale vs the project.
+        # Staleness heuristics:
+        # - embeddings_count == 0: never embedded
+        # - embeddings_count < element_count: incomplete
+        # - max_embedding_updated_at < projects.updated_at - grace: likely stale
+        grace_s = int(os.getenv("EMBED_STALE_GRACE_SECONDS", "5"))
+        try:
+            stats = await self.embedding_service.get_project_embedding_stats(project_id)
+        except Exception:
+            stats = {"count": 0, "max_updated_at": None}
+        emb_count = int(stats.get("count") or 0)
+        emb_max_iso = stats.get("max_updated_at")
+
+        try:
+            await self._ensure_db_pool()
+            if not self.db_pool:
+                return
+            row = await self.db_pool.fetchrow(
+                "SELECT updated_at, jsonb_array_length(data->'elements')::int AS n_elements FROM projects WHERE id = $1::uuid",
+                project_id,
+            )
+        except Exception:
+            row = None
+
+        n_elements = int(row.get("n_elements") or 0) if row else 0
+        proj_updated_at = row.get("updated_at") if row else None
+
+        stale = False
+        if emb_count <= 0:
+            stale = True
+        elif n_elements and emb_count < n_elements:
+            stale = True
+        elif proj_updated_at and emb_max_iso:
+            try:
+                from datetime import datetime, timezone
+
+                emb_max_dt = datetime.fromisoformat(str(emb_max_iso).replace("Z", "+00:00"))
+                if emb_max_dt.tzinfo is None:
+                    emb_max_dt = emb_max_dt.replace(tzinfo=timezone.utc)
+                # proj_updated_at is already a datetime from asyncpg (tz-aware)
+                if (proj_updated_at - emb_max_dt).total_seconds() > grace_s:
+                    stale = True
+            except Exception:
+                pass
+
+        if not stale:
+            return
+
+        self._embed_backfill_inflight.add(project_id)
+        self._embed_backfill_last_started[project_id] = now
+
+        async def _run() -> None:
+            try:
+                logger.info(f"[Embeddings] On-demand backfill starting project_id={project_id}")
+                await self.embed_project_elements(project_id)
+                logger.info(f"[Embeddings] On-demand backfill done project_id={project_id}")
+            except Exception as e:
+                logger.warning(f"[Embeddings] On-demand backfill failed project_id={project_id}: {type(e).__name__}: {e}")
+            finally:
+                self._embed_backfill_inflight.discard(project_id)
+
+        try:
+            asyncio.create_task(_run())
+        except Exception:
+            # If we can't schedule, just drop it; request can still proceed without embeddings.
+            self._embed_backfill_inflight.discard(project_id)
 
     async def _ensure_db_pool(self):
         """Ensure PostgreSQL connection pool is initialized"""
@@ -109,6 +205,9 @@ class LLMService:
         if not self.embedding_service:
             return []
         await self._ensure_db_pool()
+        # If embeddings have never been created for this project, schedule a background backfill.
+        # This keeps vec_search from being permanently useless without manual intervention.
+        await self._maybe_trigger_embed_backfill(project_id)
         rows = await self.embedding_service.vector_search(
             project_id, query_text, top_k=top_k, element_types=element_types
         )
@@ -186,6 +285,7 @@ class LLMService:
             'openai:gpt-4.1',
             deps_type=EditGraphDeps,
             system_prompt=PLAN_INTENT_PROMPT,
+            result_type=PlanIntentResponse,
         )
 
         # Node 2: Locate Scenes Agent
@@ -326,6 +426,13 @@ class LLMService:
         )
 
         # Ask loop helpers (Cursor-like retrieval + gating)
+        self.ask_plan_agent = Agent(
+            'openai:gpt-4.1',
+            deps_type=EditGraphDeps,
+            system_prompt=ASK_PLAN_PROMPT,
+            result_type=AskPlanResponse,
+        )
+
         self.ask_query_variants_agent = Agent(
             'openai:gpt-4.1',
             deps_type=EditGraphDeps,
@@ -336,12 +443,14 @@ class LLMService:
             'openai:gpt-4.1',
             deps_type=EditGraphDeps,
             system_prompt=ASK_RERANK_PROMPT,
+            result_type=AskRerankResponse,
         )
 
         self.ask_grounding_agent = Agent(
             'openai:gpt-4.1',
             deps_type=EditGraphDeps,
             system_prompt=ASK_GROUNDING_CHECK_PROMPT,
+            result_type=AskGroundingResponse,
         )
 
         # Edit loop: structured verification + revise pass
@@ -357,15 +466,6 @@ class LLMService:
             system_prompt=EDIT_REVISE_EDITS_PROMPT,
             result_type=EditResponse,
         )
-
-        # Build the graph
-        self._build_edit_graph()
-
-    def _build_edit_graph(self):
-        """Build the edit graph with 8 sequential nodes using stable API"""
-        graph, plan_node_cls = build_edit_graph(self)
-        self.edit_graph = graph
-        self._PlanIntentNode = plan_node_cls
 
     def is_configured(self) -> bool:
         return self.openai is not None
@@ -506,41 +606,35 @@ class LLMService:
                     )
 
                     queue: "asyncio.Queue[dict]" = asyncio.Queue()
+                    # Langfuse: store tool_call inputs until we see tool_result so we can emit a single span
+                    # with clear input/output (instead of 2 spans and lots of status noise).
+                    _pending_tool_inputs: Dict[str, List[Any]] = {}
 
                     async def emit(evt: dict) -> None:
-                        # Langfuse span per step-ish event (typed clients only)
+                        # Langfuse: only log high-signal steps (tools/decisions) and attach real inputs/outputs.
+                        # Avoid logging status/todos as spans; those are useful for the UI but create too much noise in Langfuse.
                         try:
-                            if trace_ctx and isinstance(evt, dict) and evt.get("type") in ("decision", "tool_call", "tool_result", "status"):
+                            if trace_ctx and isinstance(evt, dict) and evt.get("type") in ("decision", "tool_call", "tool_result"):
                                 evt_type = str(evt.get("type"))
                                 if evt_type == "tool_call":
-                                    name = f"{evt.get('tool', 'tool')}.call"
-                                    langfuse_client.span(
-                                        trace_ctx,
-                                        name=f"ask.{name}",
-                                        metadata={k: v for k, v in evt.items() if k not in ("message",)},
-                                        input=None,
-                                        output=evt,
-                                    )
+                                    tool = str(evt.get("tool") or "tool")
+                                    inp = evt.get("payload") or evt.get("prompt") or evt.get("query") or evt.get("text") or None
+                                    _pending_tool_inputs.setdefault(tool, []).append(inp)
                                 elif evt_type == "tool_result":
-                                    name = f"{evt.get('tool', 'tool')}.result"
+                                    tool = str(evt.get("tool") or "tool")
+                                    pending = _pending_tool_inputs.get(tool) or []
+                                    inp = pending.pop(0) if pending else None
+                                    _pending_tool_inputs[tool] = pending
+                                    # Emit a single span per tool with clear input/output.
                                     langfuse_client.span(
                                         trace_ctx,
-                                        name=f"ask.{name}",
-                                        metadata={k: v for k, v in evt.items() if k not in ("message",)},
-                                        input=None,
+                                        name=f"ask.{tool}",
+                                        metadata={k: v for k, v in evt.items() if k not in ("message", "payload", "prompt")},
+                                        input=inp,
                                         output=evt,
                                     )
                                 elif evt_type == "decision":
                                     name = f"decision.{evt.get('action', 'step')}"
-                                    langfuse_client.span(
-                                        trace_ctx,
-                                        name=f"ask.{name}",
-                                        metadata={k: v for k, v in evt.items() if k not in ("message",)},
-                                        input=None,
-                                        output=evt,
-                                    )
-                                else:
-                                    name = "status"
                                     langfuse_client.span(
                                         trace_ctx,
                                         name=f"ask.{name}",
@@ -610,28 +704,28 @@ class LLMService:
 
                     # Stream events incrementally from the loop via an async queue.
                     queue: "asyncio.Queue[dict]" = asyncio.Queue()
+                    _pending_tool_inputs: Dict[str, List[Any]] = {}
 
                     async def emit(evt: dict) -> None:
-                        # Langfuse span per step-ish event (typed clients only)
+                        # Langfuse: only log high-signal steps (tools/decisions/apply) and attach real inputs/outputs.
+                        # Avoid logging status/todos as spans; those create too much noise.
                         try:
-                            if trace_ctx and isinstance(evt, dict) and evt.get("type") in ("decision", "tool_call", "tool_result", "status", "apply_started", "apply_done"):
+                            if trace_ctx and isinstance(evt, dict) and evt.get("type") in ("decision", "tool_call", "tool_result", "apply_started", "apply_done"):
                                 evt_type = str(evt.get("type"))
                                 if evt_type == "tool_call":
-                                    name = f"{evt.get('tool', 'tool')}.call"
-                                    langfuse_client.span(
-                                        trace_ctx,
-                                        name=f"edit.{name}",
-                                        metadata={k: v for k, v in evt.items() if k not in ("message",)},
-                                        input=None,
-                                        output=evt,
-                                    )
+                                    tool = str(evt.get("tool") or "tool")
+                                    inp = evt.get("payload") or evt.get("prompt") or evt.get("query") or evt.get("text") or None
+                                    _pending_tool_inputs.setdefault(tool, []).append(inp)
                                 elif evt_type == "tool_result":
-                                    name = f"{evt.get('tool', 'tool')}.result"
+                                    tool = str(evt.get("tool") or "tool")
+                                    pending = _pending_tool_inputs.get(tool) or []
+                                    inp = pending.pop(0) if pending else None
+                                    _pending_tool_inputs[tool] = pending
                                     langfuse_client.span(
                                         trace_ctx,
-                                        name=f"edit.{name}",
-                                        metadata={k: v for k, v in evt.items() if k not in ("message",)},
-                                        input=None,
+                                        name=f"edit.{tool}",
+                                        metadata={k: v for k, v in evt.items() if k not in ("message", "payload", "prompt")},
+                                        input=inp,
                                         output=evt,
                                     )
                                 elif evt_type == "decision":
@@ -645,15 +739,6 @@ class LLMService:
                                     )
                                 elif evt_type in ("apply_started", "apply_done"):
                                     name = evt_type
-                                    langfuse_client.span(
-                                        trace_ctx,
-                                        name=f"edit.{name}",
-                                        metadata={k: v for k, v in evt.items() if k not in ("message",)},
-                                        input=None,
-                                        output=evt,
-                                    )
-                                else:
-                                    name = "status"
                                     langfuse_client.span(
                                         trace_ctx,
                                         name=f"edit.{name}",
@@ -692,148 +777,62 @@ class LLMService:
                     applied_edits = await loop_task
                     yield format_final_payload(applied_edits, effective_stream_events)
                 except Exception as loop_error:
-                    # Fall back to graph if loop fails
                     logger.exception(f"[edit_loop] error: {loop_error}")
-                    yield f"Edit loop error: {str(loop_error)}. Falling back to edit graph."
+                    # Fall back to legacy single-pass edit agent below
+                    if effective_stream_events:
+                        yield json.dumps(
+                            {
+                                "type": "status",
+                                "message": f"[Error] edit_loop failed; falling back to simple edit agent ({type(loop_error).__name__})",
+                            }
+                        )
+                    else:
+                        yield f"[Error] edit_loop failed; falling back to simple edit agent ({type(loop_error).__name__})\n"
                 else:
                     return
 
-        # For edit mode, use graph-based approach (fallback path)
-        if mode == 'edit' and hasattr(self, 'edit_graph'):
+        # Legacy agent-based approach (used when loops are disabled or fail)
+        deps = ChatDeps(scene_context=scene_context or '', mode=mode)
+
+        def _result_text(res: Any) -> str:
+            if hasattr(res, "data") and res.data is not None:
+                return str(res.data)
+            if hasattr(res, "output"):
+                return str(res.output)
+            if hasattr(res, "text"):
+                return str(res.text)
+            return str(res)
+
+        if mode == "edit":
             try:
-                # Create graph state and dependencies
-                graph_state = EditGraphState(
-                    user_prompt=user_prompt,
-                    scene_context=scene_context or '',
-                    message_history=message_history
+                result = await self.edit_agent.run(
+                    user_prompt, deps=deps, message_history=message_history if message_history else None
                 )
-                # Ensure DB pool is initialized before creating deps
-                await self._ensure_db_pool()
-                logger.info(f'[stream_chat] Initializing graph: project_id={project_id}, db_pool={bool(self.db_pool)}')
-                
-                graph_deps = EditGraphDeps(
-                    scene_context=scene_context or '',
-                    message_history=message_history,
-                    project_id=project_id,
-                    db_pool=self.db_pool,
-                    global_index=global_index,
-                )
-
-                # Start with first node (PlanIntentNode)
-                start_node = self._PlanIntentNode(self)
-
-                # Default typed events for edit mode unless client explicitly opts out.
-                effective_stream_events = True if stream_events is None else bool(stream_events)
-
-                # Iterate through graph nodes and stream intermediate results
-                # Use graph.iter() to get step-by-step execution
-                end_node_handled = False  # Track if we've already handled the End node
-                async with self.edit_graph.iter(start_node, state=graph_state, deps=graph_deps) as run:
-                    async for node in run:
-                        # Stream intermediate results from state buffer as steps complete
-                        if effective_stream_events:
-                            while graph_state.stream_buffer:
-                                buffer_item = graph_state.stream_buffer.pop(0)
-                                rendered = format_buffer_item(buffer_item, True)
-                                if rendered:
-                                    yield rendered
-                        else:
-                            # Legacy behavior: emit progress as plain text (so UI can display it),
-                            # but avoid streaming multiple JSON objects which breaks legacy JSON parsing.
-                            while graph_state.stream_buffer:
-                                buffer_item = graph_state.stream_buffer.pop(0)
-                                rendered = format_buffer_item(buffer_item, False)
-                                if rendered:
-                                    yield rendered
-                        
-                        # Check if we've reached the end
-                        from pydantic_graph import End
-                        if isinstance(node, End):
-                            end_node_handled = True  # Mark that we've handled the End node
-                            
-                            # Stream any remaining buffer items (intermediate status messages) first
-                            if effective_stream_events:
-                                while graph_state.stream_buffer:
-                                    buffer_item = graph_state.stream_buffer.pop(0)
-                                    rendered = format_buffer_item(buffer_item, True)
-                                    if rendered:
-                                        yield rendered
-                            else:
-                                while graph_state.stream_buffer:
-                                    buffer_item = graph_state.stream_buffer.pop(0)
-                                    rendered = format_buffer_item(buffer_item, False)
-                                    if rendered:
-                                        yield rendered
-                            
-                            # Stream final output - prioritize applied_edits
-                            # Use typed event format for final output
-                            if graph_state.applied_edits:
-                                _edits = graph_state.applied_edits.get('edits', []) if isinstance(graph_state.applied_edits, dict) else []
-                                logger.info(
-                                    f"[EditGraph] Streaming final edits ({len(_edits) if isinstance(_edits, list) else 0} edits)"
-                                )
-
-                                yield format_final_payload(graph_state.applied_edits, effective_stream_events)
-                            elif graph_state.final_summary:
-                                # If no edits but we have a summary, check if summary contains JSON
-                                json_match = re.search(r'\{[\s\S]*"edits"[\s\S]*?\}', graph_state.final_summary, re.DOTALL)
-                                if json_match:
-                                    yield json_match.group(0)
-                                else:
-                                    yield graph_state.final_summary
-                            elif node.data:
-                                # Try to parse node.data - might be JSON string
-                                try:
-                                    data_str = str(node.data)
-                                    # Check if it's already JSON
-                                    if data_str.strip().startswith('{'):
-                                        # Validate it's valid JSON
-                                        parsed = json.loads(data_str)
-                                        yield json.dumps(parsed, indent=2)
-                                    else:
-                                        yield data_str
-                                except json.JSONDecodeError:
-                                    yield str(node.data)
-                                except:
-                                    yield str(node.data)
-                            else:
-                                yield "No edits generated"
-                            break
-                    
-                    # Final check: ONLY if we didn't hit End node but have edits, stream them
-                    # This is a safety net in case End node wasn't properly detected
-                    if not end_node_handled and graph_state.applied_edits:
-                        logger.info("[EditGraph] Safety check - streaming edits (End node not detected)")
-                        yield format_final_payload(graph_state.applied_edits, effective_stream_events)
-                    elif not end_node_handled and graph_state.final_summary:
-                        # Stream summary as status event
-                        yield json.dumps({"type": "status", "message": graph_state.final_summary})
-            except Exception as graph_error:
-                # If graph execution fails, fall back to simple agent
-                yield f"Graph error: {str(graph_error)}. Falling back to simple edit agent."
-                # Fall through to simple agent approach below
-                pass
+                text = _result_text(result)
+                # Best-effort: extract a JSON object that contains `"edits"`.
+                json_candidate = text
+                m = re.search(r'\{[\s\S]*"edits"[\s\S]*\}', text, re.DOTALL)
+                if m:
+                    json_candidate = m.group(0)
+                try:
+                    applied_edits = json.loads(json_candidate)
+                    if not isinstance(applied_edits, dict) or "edits" not in applied_edits:
+                        applied_edits = {"edits": []}
+                except Exception:
+                    applied_edits = {"edits": []}
+                yield format_final_payload(applied_edits, effective_stream_events)
             except Exception as e:
                 yield f"Error: {str(e)}"
             return
 
-        # For ask mode, use existing agent-based approach
-        # Create dependencies
-        deps = ChatDeps(
-            scene_context=scene_context or '',
-            mode=mode
-        )
-
-        # Select agent based on mode
-        agent = self.ask_agent
-
+        # Ask mode: stream deltas from ask_agent
         try:
-            async with agent.run_stream(user_prompt, deps=deps, message_history=message_history if message_history else None) as result:
-                # Use delta=True to send only new text portions (not full progressive text)
+            async with self.ask_agent.run_stream(
+                user_prompt, deps=deps, message_history=message_history if message_history else None
+            ) as result:
                 async for text in result.stream_text(delta=True):
                     yield text
         except Exception as e:
-            # Fallback: yield error as text
             yield f"Error: {str(e)}"
 
     async def execute_command(self, request) -> str:

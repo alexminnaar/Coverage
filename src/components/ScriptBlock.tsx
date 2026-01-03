@@ -318,16 +318,16 @@ export default function ScriptBlock({
           <div className="pending-edit-container pending-insert-container">
             {showNewElements && (
               <div className="pending-edit-new-elements">
-                <div style={{ fontSize: '0.85rem', color: '#6b7280', marginBottom: '0.5rem', fontStyle: 'italic' }}>
+                <div className="pending-edit-new-elements-label">
                   Adding after this element:
                 </div>
                 {pendingEdit.newElements && pendingEdit.newElements.map((newEl, idx) => (
                   <div key={idx} className={`script-block script-block--${newEl.type}`} style={{ marginTop: '0.5rem' }}>
                     <div className="block-content-wrapper">
-                      <div className="block-type-indicator" style={{ fontSize: '0.75rem', color: '#10b981', marginBottom: '0.25rem' }}>
+                      <div className="block-type-indicator pending-edit-type-indicator">
                         [{ELEMENT_LABELS[newEl.type]}]
                       </div>
-                      <div className="block-content" style={{ color: '#10b981', fontWeight: 500 }}>
+                      <div className="block-content pending-edit-added-content">
                         {newEl.content}
                       </div>
                     </div>
@@ -367,10 +367,7 @@ export default function ScriptBlock({
           {showOriginal && (
             <div className="pending-edit-original">
               <div className="block-content-wrapper">
-                <div
-                  className="block-content"
-                  style={{ opacity: 0.7, color: '#ef4444' }}
-                >
+                <div className="block-content">
                   {element.content || '(empty)'}
                 </div>
               </div>
@@ -381,7 +378,7 @@ export default function ScriptBlock({
           {showNewContent && (
             <div className="pending-edit-new">
               <div className="block-content-wrapper">
-                <div className="block-content" style={{ color: '#10b981', fontWeight: 500 }}>
+                <div className="block-content">
                   {pendingEdit.newContent}
                 </div>
               </div>
@@ -392,16 +389,16 @@ export default function ScriptBlock({
         {/* New Elements (if any) */}
         {showNewElements && pendingEdit.newElements && (
           <div className="pending-edit-new-elements">
-            <div style={{ fontSize: '0.85rem', color: '#6b7280', marginBottom: '0.5rem', fontStyle: 'italic' }}>
+            <div className="pending-edit-new-elements-label">
               Then adding:
             </div>
             {pendingEdit.newElements.map((newEl, idx) => (
               <div key={idx} className={`script-block script-block--${newEl.type}`} style={{ marginTop: '0.5rem' }}>
                 <div className="block-content-wrapper">
-                  <div className="block-type-indicator" style={{ fontSize: '0.75rem', color: '#10b981', marginBottom: '0.25rem' }}>
+                  <div className="block-type-indicator pending-edit-type-indicator">
                     [{ELEMENT_LABELS[newEl.type]}]
                   </div>
-                  <div className="block-content" style={{ color: '#10b981', fontWeight: 500 }}>
+                  <div className="block-content pending-edit-added-content">
                     {newEl.content}
                   </div>
                 </div>

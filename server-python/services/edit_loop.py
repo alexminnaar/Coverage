@@ -60,6 +60,10 @@ class EditLoopState:
     verification_result: Optional[str] = None
     verification_issues: list[str] = field(default_factory=list)
 
+    todos: Optional[list[dict]] = None
+    todo_status: Dict[str, str] = field(default_factory=dict)
+    todos_emitted: bool = False
+
     apply_started_emitted: bool = False
 
     # Context extraction window for DB extraction; increased on recovery attempts
@@ -150,6 +154,40 @@ def _safe_json_dict(text: str) -> Dict[str, Any]:
     return {}
 
 
+def _normalize_plan_todos(raw: Any, *, fallback: list[dict]) -> list[dict]:
+    todos: list[dict] = []
+    if isinstance(raw, list):
+        for it in raw:
+            if not isinstance(it, dict):
+                continue
+            tid = str(it.get("id") or "").strip()
+            label = str(it.get("label") or "").strip()
+            if not tid or not label:
+                continue
+            todos.append({"id": tid, "label": label, "status": "pending"})
+    if not todos:
+        todos = [{"id": str(x.get("id")), "label": str(x.get("label")), "status": "pending"} for x in fallback]
+    seen: set[str] = set()
+    out: list[dict] = []
+    for t in todos:
+        tid = str(t.get("id") or "")
+        if not tid or tid in seen:
+            continue
+        seen.add(tid)
+        out.append(t)
+    return out[:12]
+
+
+def _safe_json_dict(text: str) -> Dict[str, Any]:
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    return {}
+
+
 async def run_edit_loop(
     llm_service: Any,
     *,
@@ -174,6 +212,38 @@ async def run_edit_loop(
 
     while state.iterations < budgets.max_iterations:
         state.iterations += 1
+
+        async def todo_update(todo_id: str, status: str) -> None:
+            todo_id = str(todo_id or "").strip()
+            status = str(status or "").strip()
+            if not todo_id or not status:
+                return
+            if state.todo_status.get(todo_id) == status:
+                return
+            state.todo_status[todo_id] = status
+            label = None
+            try:
+                for t in (state.todos or []):
+                    if str(t.get("id")) == todo_id:
+                        label = t.get("label")
+                        break
+            except Exception:
+                label = None
+            await emit({"type": "todo_update", "id": todo_id, "status": status, "label": label})
+
+        async def todo_finish_sweep() -> None:
+            """Mark any remaining todos as skipped so the UI doesn't show dangling items."""
+            try:
+                for t in (state.todos or []):
+                    tid = str(t.get("id") or "").strip()
+                    if not tid:
+                        continue
+                    cur = state.todo_status.get(tid) or str(t.get("status") or "pending")
+                    if cur in ("done", "skipped"):
+                        continue
+                    await todo_update(tid, "skipped")
+            except Exception:
+                return
 
         # ROUTE
         if state.intent is None:
@@ -200,12 +270,68 @@ async def run_edit_loop(
                 + "\nEND_SCENE_CONTEXT\n"
             )
             await emit({"type": "tool_call", "tool": "llm.plan_intent", "prompt": prompt[:4000]})
-            result = await llm_service.plan_intent_agent.run(prompt, deps=deps)
-            out = get_result_output(result)
-            state.intent = out
-            logger.info(f"[edit_loop] planned_intent len={len(out)} preview={out[:120]!r}")
-            await emit({"type": "tool_result", "tool": "llm.plan_intent", "intent_preview": out[:800]})
-            await emit({"type": "status", "message": f"[Planning] {out[:120]}..."})
+            result = await llm_service.plan_intent_agent.run(
+                prompt, deps=deps, message_history=state.message_history or None
+            )
+            plan_obj: dict = {}
+            raw_out = ""
+            if hasattr(result, "data") and isinstance(getattr(result, "data"), dict):
+                plan_obj = dict(getattr(result, "data") or {})
+            else:
+                raw_out = get_result_output(result)
+                plan_obj = _safe_json_dict(raw_out)
+            intent_text = str(plan_obj.get("intent") or raw_out or "")
+            state.intent = intent_text
+
+            # Emit tool_result immediately so Langfuse shows the LLM step even if we early-exit on clarify.
+            logger.info(f"[edit_loop] planned_intent len={len(intent_text)} preview={intent_text[:120]!r}")
+            await emit(
+                {
+                    "type": "tool_result",
+                    "tool": "llm.plan_intent",
+                    "intent_preview": intent_text[:800],
+                    "plan": plan_obj,
+                    "raw_output_preview": (raw_out[:1200] if (not plan_obj) and raw_out else None),
+                }
+            )
+
+            # Emit plan todos once (LLM-provided with fallback).
+            if not state.todos_emitted:
+                fallback = [
+                    {"id": "plan_intent", "label": "Understand edit intent"},
+                    {"id": "clarify", "label": "Ask clarifying questions"},
+                    {"id": "locate", "label": "Locate relevant elements"},
+                    {"id": "load_context", "label": "Load relevant context"},
+                    {"id": "propose", "label": "Propose edits"},
+                    {"id": "refine", "label": "Refine edits"},
+                    {"id": "verify", "label": "Verify constraints"},
+                ]
+                state.todos = _normalize_plan_todos(plan_obj.get("todos"), fallback=fallback)
+                state.todos_emitted = True
+                await emit({"type": "plan_todos", "todos": state.todos})
+                await todo_update("plan_intent", "done")
+
+            # Clarify early-exit: ask user for missing info rather than editing the wrong target.
+            next_action = str(plan_obj.get("next_action") or "proceed").strip().lower()
+            if next_action == "clarify":
+                await emit({"type": "decision", "action": "clarify", "why": "planner needs more information"})
+                await todo_update("clarify", "in_progress")
+                qs = plan_obj.get("clarifying_questions")
+                questions: list[str] = []
+                if isinstance(qs, list):
+                    questions = [str(x).strip() for x in qs if str(x).strip()]
+                if not questions:
+                    questions = ["Which scene/line should I edit, and what tone/intent should the rewrite have?"]
+                await emit(
+                    {
+                        "type": "status",
+                        "message": "I need a bit more info before editing:\n- " + "\n- ".join(questions[:3]),
+                    }
+                )
+                await todo_update("clarify", "done")
+                await todo_finish_sweep()
+                return {"edits": []}
+            await emit({"type": "status", "message": f"[Planning] {intent_text[:120]}..."})
             continue
 
         if not state.relevant_element_ids and state.locate_attempts < budgets.max_locate_attempts:
@@ -218,6 +344,7 @@ async def run_edit_loop(
                     "why": "no candidates yet" + ("; broadening" if broaden else ""),
                 }
             )
+            await todo_update("locate", "in_progress")
 
             # 1) extract search terms
             terms_prompt = (
@@ -233,7 +360,9 @@ async def run_edit_loop(
                     "attempt": state.locate_attempts,
                 }
             )
-            terms_result = await llm_service.extract_search_terms_agent.run(terms_prompt, deps=deps)
+            terms_result = await llm_service.extract_search_terms_agent.run(
+                terms_prompt, deps=deps, message_history=state.message_history or None
+            )
             state.search_terms = _extract_search_terms(get_result_output(terms_result))
             await emit(
                 {
@@ -296,6 +425,7 @@ async def run_edit_loop(
                 if element_ids:
                     state.relevant_element_ids = element_ids
                     await emit({"type": "status", "message": f"[Locating] Found {len(element_ids)} relevant elements via retrieval"})
+                    await todo_update("locate", "done")
                     continue
 
             # LLM fallback locate: safe even in "scene_plus_adjacent" because deps.scene_context is a bounded window.
@@ -308,7 +438,9 @@ async def run_edit_loop(
                     f"Context window:\n{deps.scene_context}"
                 )
                 await emit({"type": "tool_call", "tool": "llm.locate_fallback", "prompt": locate_prompt[:4000]})
-                locate_result = await llm_service.locate_scenes_agent.run(locate_prompt, deps=deps)
+                locate_result = await llm_service.locate_scenes_agent.run(
+                    locate_prompt, deps=deps, message_history=state.message_history or None
+                )
                 locate_text = get_result_output(locate_result)
                 ids = UUID_RE.findall(locate_text)
                 await emit(
@@ -325,6 +457,7 @@ async def run_edit_loop(
                     ids = list(state.context_element_ids)[:20]
                 state.relevant_element_ids = ids
                 await emit({"type": "status", "message": f"[Locating] Found {len(ids)} relevant elements via LLM"})
+                await todo_update("locate", "done")
                 continue
 
             await emit(
@@ -334,10 +467,12 @@ async def run_edit_loop(
                     "Try selecting the exact dialogue/scene, or switch to full context.",
                 }
             )
+            await todo_finish_sweep()
             return {"edits": []}
 
         if state.loaded_context is None:
             await emit({"type": "decision", "action": "load_context", "why": "context not loaded"})
+            await todo_update("load_context", "in_progress")
 
             if deps.project_id and deps.db_pool and state.relevant_element_ids:
                 await emit(
@@ -371,6 +506,7 @@ async def run_edit_loop(
                             "message": f"[Loading Context] ✅ Extracted {len(state.relevant_element_ids)} elements from database",
                         }
                     )
+                    await todo_update("load_context", "done")
                     continue
                 await emit(
                     {
@@ -386,7 +522,9 @@ async def run_edit_loop(
             ids_str = ", ".join(state.relevant_element_ids[:10])
             prompt = f"Extract context for these element IDs: {ids_str}\n\nFull screenplay:\n{deps.scene_context}"
             await emit({"type": "tool_call", "tool": "llm.load_context_fallback", "prompt": prompt[:4000]})
-            result = await llm_service.load_context_agent.run(prompt, deps=deps)
+            result = await llm_service.load_context_agent.run(
+                prompt, deps=deps, message_history=state.message_history or None
+            )
             state.loaded_context = get_result_output(result)
             await emit(
                 {
@@ -397,10 +535,12 @@ async def run_edit_loop(
                 }
             )
             await emit({"type": "status", "message": "[Loading Context] Extracted context via LLM"})
+            await todo_update("load_context", "done")
             continue
 
         if state.understanding is None:
             await emit({"type": "decision", "action": "synthesize", "why": "understanding not synthesized"})
+            await todo_update("synthesize", "in_progress")
             selection = f"\nSelected text:\n{state.selected_text}\n" if state.selected_text else ""
             prompt = f"""Intent: {state.intent}{selection}
 Relevant Context: {state.loaded_context}
@@ -408,14 +548,18 @@ Context window: {deps.scene_context}
 
 Synthesize a comprehensive understanding of what needs to change."""
             await emit({"type": "tool_call", "tool": "llm.synthesize", "prompt": prompt[:4000]})
-            result = await llm_service.synthesize_agent.run(prompt, deps=deps)
+            result = await llm_service.synthesize_agent.run(
+                prompt, deps=deps, message_history=state.message_history or None
+            )
             state.understanding = get_result_output(result)
             await emit({"type": "tool_result", "tool": "llm.synthesize", "understanding_preview": (state.understanding or "")[:800]})
             await emit({"type": "status", "message": "[Synthesizing] Understanding complete"})
+            await todo_update("synthesize", "done")
             continue
 
         if state.proposed_edits is None:
             await emit({"type": "decision", "action": "propose_edits", "why": "no proposed edits yet"})
+            await todo_update("propose", "in_progress")
             selection = f"\nSelected text:\n{state.selected_text}\n" if state.selected_text else ""
             prompt = f"""Understanding: {state.understanding}{selection}
 Relevant Context: {state.loaded_context}
@@ -423,7 +567,9 @@ Context window: {deps.scene_context}
 
 Generate specific edit proposals."""
             await emit({"type": "tool_call", "tool": "llm.propose_edits", "prompt": prompt[:4000]})
-            result = await llm_service.propose_edits_agent.run(prompt, deps=deps)
+            result = await llm_service.propose_edits_agent.run(
+                prompt, deps=deps, message_history=state.message_history or None
+            )
             edits = _coerce_edit_response(getattr(result, "data", None) if hasattr(result, "data") else result)
             state.proposed_edits = edits or {"edits": []}
             logger.info(f"[edit_loop] proposed_edits n={len((state.proposed_edits or {}).get('edits', []))}")
@@ -436,6 +582,7 @@ Generate specific edit proposals."""
                 }
             )
             await emit({"type": "status", "message": "[Proposing] Generated edit proposals"})
+            await todo_update("propose", "done")
             continue
 
         if state.applied_edits is None and state.refine_attempts < budgets.max_refine_attempts:
@@ -447,6 +594,7 @@ Generate specific edit proposals."""
                     "why": "refining proposed edits" + (f" (attempt {state.refine_attempts})" if state.refine_attempts > 1 else ""),
                 }
             )
+            await todo_update("refine", "in_progress")
             # Cursor-like: this is the phase where we actually generate the rewritten content.
             # Emit apply_started here so the UI shows the \"Edit Dialogue\" pill during refinement+verification.
             if not state.apply_started_emitted:
@@ -469,7 +617,9 @@ Known issues:\n{issues}
 
 Validate and refine these edits."""
             await emit({"type": "tool_call", "tool": "llm.refine_edits", "prompt": prompt[:4000], "attempt": state.refine_attempts})
-            result = await llm_service.refine_edits_agent.run(prompt, deps=deps)
+            result = await llm_service.refine_edits_agent.run(
+                prompt, deps=deps, message_history=state.message_history or None
+            )
             edits = _coerce_edit_response(getattr(result, "data", None) if hasattr(result, "data") else result)
             state.applied_edits = edits or (state.proposed_edits or {"edits": []})
             logger.info(
@@ -484,12 +634,14 @@ Validate and refine these edits."""
                 }
             )
             await emit({"type": "status", "message": "[Refining] Edits validated and refined"})
+            await todo_update("refine", "done")
             continue
 
         # VERIFY: lightweight validation + optional agent verification
         if state.verify_attempts < budgets.max_verify_attempts:
             state.verify_attempts += 1
             await emit({"type": "decision", "action": "verify", "why": f"verification attempt {state.verify_attempts}"})
+            await todo_update("verify", "in_progress")
             state.verification_issues = []
 
             applied = state.applied_edits or {"edits": []}
@@ -541,7 +693,9 @@ Validate and refine these edits."""
                     }
                 )
                 await emit({"type": "tool_call", "tool": "llm.verify_structured", "payload": payload[:4000], "attempt": state.verify_attempts})
-                result = await llm_service.edit_verify_structured_agent.run(payload, deps=deps)
+                result = await llm_service.edit_verify_structured_agent.run(
+                    payload, deps=deps, message_history=state.message_history or None
+                )
                 verify_obj = _safe_json_dict(get_result_output(result))
                 await emit({"type": "tool_result", "tool": "llm.verify_structured", "verify": verify_obj})
                 verifier_ok = bool(verify_obj.get("ok", True))
@@ -572,7 +726,9 @@ Pre-check issues: {state.verification_issues if state.verification_issues else '
 
 Verify continuity and formatting."""
                 await emit({"type": "tool_call", "tool": "llm.verify_freeform", "prompt": prompt[:4000], "attempt": state.verify_attempts})
-                result = await llm_service.verify_agent.run(prompt, deps=deps)
+                result = await llm_service.verify_agent.run(
+                    prompt, deps=deps, message_history=state.message_history or None
+                )
                 verify_text = get_result_output(result)
                 state.verification_result = verify_text
                 await emit({"type": "tool_result", "tool": "llm.verify_freeform", "verify_preview": (verify_text or "")[:1200]})
@@ -633,7 +789,9 @@ Verify continuity and formatting."""
                         }
                     )
                     await emit({"type": "tool_call", "tool": "llm.revise_edits", "payload": revise_payload[:4000]})
-                    revise_result = await llm_service.edit_revise_edits_agent.run(revise_payload, deps=deps)
+                    revise_result = await llm_service.edit_revise_edits_agent.run(
+                        revise_payload, deps=deps, message_history=state.message_history or None
+                    )
                     revised = _coerce_edit_response(
                         getattr(revise_result, "data", None) if hasattr(revise_result, "data") else revise_result
                     )
@@ -652,19 +810,24 @@ Verify continuity and formatting."""
                 await emit({"type": "status", "message": "[Verifying] Cannot safely apply edits; aborting"})
                 await emit({"type": "apply_done"})
                 logger.info("[edit_loop] abort: returning empty edits")
+                await todo_finish_sweep()
                 return {"edits": []}
 
             await emit({"type": "status", "message": "[Verifying] Continuity check complete"})
+            await todo_update("verify", "done")
 
         # APPLY PHASE (UI marker): we’re done generating/validating edits; emit completion marker.
         await emit({"type": "apply_done"})
 
         # FINISH
         logger.info(f"[edit_loop] finish edits_n={len((state.applied_edits or {}).get('edits', []))}")
+        await todo_update("finish", "done")
+        await todo_finish_sweep()
         return state.applied_edits or {"edits": []}
 
     # Budget exceeded: return empty edits with a clear status
     await emit({"type": "status", "message": "[Error] Exceeded iteration budget; no edits generated"})
+    await todo_finish_sweep()
     return {"edits": []}
 
 

@@ -223,4 +223,41 @@ class EmbeddingService:
             for r in rows
         ]
 
+    async def count_project_embeddings(self, project_id: str) -> int:
+        """Return number of stored embeddings for a project (0 if none/DB unavailable)."""
+        await self.ensure_schema()
+        await self._db.ensure_pool()
+        if not self._db.pool:
+            return 0
+        try:
+            row = await self._db.pool.fetchrow(
+                "SELECT COUNT(*)::int AS n FROM project_element_embeddings WHERE project_id = $1::uuid",
+                project_id,
+            )
+            return int(row["n"] if row and row.get("n") is not None else 0)
+        except Exception:
+            return 0
+
+    async def get_project_embedding_stats(self, project_id: str) -> Dict[str, Any]:
+        """Return basic embedding stats for a project: {count:int, max_updated_at:str|None}."""
+        await self.ensure_schema()
+        await self._db.ensure_pool()
+        if not self._db.pool:
+            return {"count": 0, "max_updated_at": None}
+        try:
+            row = await self._db.pool.fetchrow(
+                "SELECT COUNT(*)::int AS n, MAX(updated_at) AS max_ts FROM project_element_embeddings WHERE project_id = $1::uuid",
+                project_id,
+            )
+            if not row:
+                return {"count": 0, "max_updated_at": None}
+            # asyncpg returns datetime for timestamptz; JSON-ify later by isoformat.
+            max_ts = row.get("max_ts")
+            return {
+                "count": int(row.get("n") or 0),
+                "max_updated_at": max_ts.isoformat() if hasattr(max_ts, "isoformat") else None,
+            }
+        except Exception:
+            return {"count": 0, "max_updated_at": None}
+
 

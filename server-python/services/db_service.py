@@ -138,7 +138,25 @@ class DBService:
                         MAX(idx) + $3 AS end_idx
                     FROM target_indices
                 )
-                SELECT elem, idx
+                SELECT
+                    elem,
+                    idx,
+                    (
+                        SELECT sh.elem->>'id'
+                        FROM indexed_elements sh
+                        WHERE (sh.elem->>'type') = 'scene-heading'
+                          AND sh.idx <= indexed_elements.idx
+                        ORDER BY sh.idx DESC
+                        LIMIT 1
+                    ) AS scene_id,
+                    (
+                        SELECT sh.elem->>'content'
+                        FROM indexed_elements sh
+                        WHERE (sh.elem->>'type') = 'scene-heading'
+                          AND sh.idx <= indexed_elements.idx
+                        ORDER BY sh.idx DESC
+                        LIMIT 1
+                    ) AS scene_heading
                 FROM indexed_elements, context_range
                 WHERE idx BETWEEN start_idx AND end_idx
                 ORDER BY idx
@@ -165,8 +183,17 @@ class DBService:
                 elem_id = elem.get("id", "")
                 elem_type = elem.get("type", "")
                 elem_content = elem.get("content", "")
+                elem_index = row.get("idx")
+                scene_id = row.get("scene_id") or ""
+                scene_heading = row.get("scene_heading") or ""
                 formatted.append(
-                    f"Element:\n- id: {elem_id}\n- type: {elem_type}\n- content: {elem_content}"
+                    "Element:\n"
+                    f"- id: {elem_id}\n"
+                    f"- type: {elem_type}\n"
+                    f"- elementIndex: {elem_index}\n"
+                    + (f"- sceneId: {scene_id}\n" if scene_id else "")
+                    + (f"- sceneHeading: {scene_heading}\n" if scene_heading else "")
+                    + f"- content: {elem_content}"
                 )
 
             context_str = "\n\n".join(formatted)
@@ -231,62 +258,10 @@ class DBService:
         if not self.pool:
             return []
 
-    async def fetch_elements_by_ids(
-        self,
-        project_id: str,
-        element_ids: List[str],
-    ) -> List[Dict[str, object]]:
-        """Fetch specific screenplay elements by ID.
-
-        Returns list of dicts:
-        - element_id (str)
-        - element_type (str)
-        - element_index (int)
-        - content (str)
-        """
-        await self.ensure_pool()
-        if not self.pool:
-            return []
-        if not element_ids:
-            return []
-
         try:
             query = """
                 WITH indexed_elements AS (
-                    SELECT 
-                        elem->>'id' AS element_id,
-                        elem->>'type' AS element_type,
-                        (ordinality - 1)::int AS element_index,
-                        elem->>'content' AS content
-                    FROM projects p,
-                         LATERAL jsonb_array_elements(p.data->'elements') WITH ORDINALITY t(elem, ordinality)
-                    WHERE p.id = $1::uuid
-                )
-                SELECT element_id, element_type, element_index, content
-                FROM indexed_elements
-                WHERE element_id = ANY($2::text[])
-            """
-            rows = await self.pool.fetch(query, project_id, element_ids)
-            # Preserve input order
-            by_id: Dict[str, Dict[str, object]] = {
-                str(r["element_id"]): {
-                    "element_id": r["element_id"],
-                    "element_type": r["element_type"],
-                    "element_index": r["element_index"],
-                    "content": r["content"] or "",
-                }
-                for r in rows
-            }
-            return [by_id[eid] for eid in element_ids if eid in by_id]
-        except Exception as e:
-            logger.error(f"[DB Elements] ❌ Error fetching elements by ids: {type(e).__name__}: {e}")
-            return []
-
-        try:
-            query = """
-                WITH indexed_elements AS (
-                    SELECT 
-                        elem,
+                    SELECT
                         elem->>'id' AS element_id,
                         elem->>'type' AS element_type,
                         (ordinality - 1)::int AS element_index,
@@ -321,6 +296,79 @@ class DBService:
             ]
         except Exception as e:
             logger.error(f"[DB Elements] ❌ Error fetching project elements: {type(e).__name__}: {e}")
+            return []
+
+    async def fetch_elements_by_ids(
+        self,
+        project_id: str,
+        element_ids: List[str],
+    ) -> List[Dict[str, object]]:
+        """Fetch specific screenplay elements by ID.
+
+        Returns list of dicts:
+        - element_id (str)
+        - element_type (str)
+        - element_index (int)
+        - content (str)
+        """
+        await self.ensure_pool()
+        if not self.pool:
+            return []
+        if not element_ids:
+            return []
+
+        try:
+            query = """
+                WITH indexed_elements AS (
+                    SELECT 
+                        elem->>'id' AS element_id,
+                        elem->>'type' AS element_type,
+                        (ordinality - 1)::int AS element_index,
+                        elem->>'content' AS content
+                    FROM projects p,
+                         LATERAL jsonb_array_elements(p.data->'elements') WITH ORDINALITY t(elem, ordinality)
+                    WHERE p.id = $1::uuid
+                )
+                SELECT
+                    element_id,
+                    element_type,
+                    element_index,
+                    content,
+                    (
+                        SELECT sh.element_id
+                        FROM indexed_elements sh
+                        WHERE sh.element_type = 'scene-heading'
+                          AND sh.element_index <= indexed_elements.element_index
+                        ORDER BY sh.element_index DESC
+                        LIMIT 1
+                    ) AS scene_id,
+                    (
+                        SELECT sh.content
+                        FROM indexed_elements sh
+                        WHERE sh.element_type = 'scene-heading'
+                          AND sh.element_index <= indexed_elements.element_index
+                        ORDER BY sh.element_index DESC
+                        LIMIT 1
+                    ) AS scene_heading
+                FROM indexed_elements
+                WHERE element_id = ANY($2::text[])
+            """
+            rows = await self.pool.fetch(query, project_id, element_ids)
+            # Preserve input order
+            by_id: Dict[str, Dict[str, object]] = {
+                str(r["element_id"]): {
+                    "element_id": r["element_id"],
+                    "element_type": r["element_type"],
+                    "element_index": r["element_index"],
+                    "content": r["content"] or "",
+                    "scene_id": r.get("scene_id"),
+                    "scene_heading": r.get("scene_heading"),
+                }
+                for r in rows
+            }
+            return [by_id[eid] for eid in element_ids if eid in by_id]
+        except Exception as e:
+            logger.error(f"[DB Elements] ❌ Error fetching elements by ids: {type(e).__name__}: {e}")
             return []
 
 

@@ -26,34 +26,66 @@ class EditResponse(TypedDict):
     edits: List[EditProposal]
 
 
+# ----------------------------
+# Ask loop structured outputs
+# ----------------------------
+class AskPlanTodo(TypedDict):
+    id: str
+    label: str
+
+
+class AskPlanCoverage(TypedDict):
+    must_include_scene_ids: List[str]
+    must_include_element_ids: List[str]
+
+
+class AskPlanResponse(TypedDict):
+    todos: List[AskPlanTodo]
+    intent: str
+    next_action: str
+    use_context: bool
+    clarifying_questions: List[str]
+    coverage: AskPlanCoverage
+    query_variants: List[str]
+    answer_outline: List[str]
+
+
+class AskRerankEvidence(TypedDict):
+    elementId: str
+    why: str
+
+
+class AskRerankResponse(TypedDict):
+    selectedElementIds: List[str]
+    evidence: List[AskRerankEvidence]
+
+
+class AskGroundingResponse(TypedDict):
+    grounded: bool
+    missing: List[str]
+    next_action: str
+
+
+# ----------------------------
+# Edit loop structured outputs
+# ----------------------------
+class PlanIntentTodo(TypedDict):
+    id: str
+    label: str
+
+
+class PlanIntentResponse(TypedDict):
+    intent: str
+    next_action: str
+    clarifying_questions: List[str]
+    todos: List[PlanIntentTodo]
+
+
 # Dependencies for chat agents
 @dataclass
 class ChatDeps:
     scene_context: str
     mode: str
-
-
-# Graph state for edit mode
-@dataclass
-class EditGraphState:
-    user_prompt: str
-    scene_context: str
-    message_history: List[ModelMessage] = field(default_factory=list)
-    intent: Optional[str] = None
-    relevant_scene_ids: List[str] = field(default_factory=list)
-    loaded_context: Optional[str] = None
-    understanding: Optional[str] = None
-    proposed_edits: Optional[EditResponse] = None
-    applied_edits: Optional[EditResponse] = None
-    verification_result: Optional[str] = None
-    final_summary: Optional[str] = None
-    # stream_buffer items are "typed events" with the minimal schema:
-    # {"type": "status", "message": "<human readable status>"}
-    #
-    # These are rendered for clients in two ways:
-    # - streamEvents=True: each item is streamed as JSON (one object per SSE message)
-    # - streamEvents=False/None: status messages are streamed as plain text lines
-    stream_buffer: List[Dict[str, Any]] = field(default_factory=list)
 
 
 # Graph dependencies for edit mode

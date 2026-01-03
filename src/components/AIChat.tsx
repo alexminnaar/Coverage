@@ -119,7 +119,7 @@ export default function AIChat({
   const [showEditList, setShowEditList] = useState(false);
   const [selectionSnapshot, setSelectionSnapshot] = useState<string>('');
   const [activeTextareaElementId, setActiveTextareaElementId] = useState<string | null>(null);
-  const [includeBeats, setIncludeBeats] = useState(true);
+  // Beats are always included in AI context (no toggle).
 
   // Resize state
   const [isDragging, setIsDragging] = useState(false);
@@ -131,7 +131,6 @@ export default function AIChat({
   );
 
   const beatContextBlock = useMemo(() => {
-    if (!includeBeats) return '';
     const list = (beats || []).slice();
     if (!list.length) return '';
 
@@ -164,7 +163,7 @@ export default function AIChat({
     });
     lines.push('Use beats to ground answers and edits in story structure. If a change conflicts with beats, call it out.');
     return lines.join('\n') + '\n\n---\n\n';
-  }, [beats, beatStructure, includeBeats]);
+  }, [beats, beatStructure]);
 
   // (debug instrumentation removed)
 
@@ -308,12 +307,12 @@ export default function AIChat({
       .map(s => s.split('\n')[0].trim())
       .filter(s => /^\[[^\]]+\]/.test(s));
 
-    // De-dupe consecutive duplicates and keep the most recent steps
+    // De-dupe consecutive duplicates and keep only the most recent step
     const deduped: string[] = [];
     for (const s of steps) {
       if (deduped.length === 0 || deduped[deduped.length - 1] !== s) deduped.push(s);
     }
-    return deduped.slice(-12);
+    return deduped.slice(-1);
   };
 
   const timelineLinesFromEvents = (events?: AIStreamEvent[]): string[] => {
@@ -338,14 +337,78 @@ export default function AIChat({
       }
     }
 
-    // De-dupe consecutive duplicates and keep the most recent lines
+    // De-dupe consecutive duplicates and keep only the most recent line
     const deduped: string[] = [];
     for (const s of lines) {
       const t = String(s || '').trim();
       if (!t) continue;
       if (deduped.length === 0 || deduped[deduped.length - 1] !== t) deduped.push(t);
     }
-    return deduped.slice(-12);
+    return deduped.slice(-1);
+  };
+
+  type TodoView = { id: string; label: string; status: string };
+
+  const extractTodosFromEvents = (events?: AIStreamEvent[]): TodoView[] => {
+    if (!events || events.length === 0) return [];
+    let planIdx = -1;
+    for (let i = events.length - 1; i >= 0; i--) {
+      const evt: any = events[i];
+      if (evt && evt.type === 'plan_todos' && Array.isArray(evt.todos)) {
+        planIdx = i;
+        break;
+      }
+    }
+    if (planIdx === -1) return [];
+
+    const planEvt: any = events[planIdx] as any;
+    const initialTodos: TodoView[] = (planEvt.todos as any[])
+      .filter(t => t && typeof t === 'object')
+      .map(t => ({
+        id: String((t as any).id || '').trim(),
+        label: String((t as any).label || '').trim(),
+        status: String((t as any).status || 'pending').trim(),
+      }))
+      .filter(t => t.id && t.label);
+
+    if (initialTodos.length === 0) return [];
+
+    const byId = new Map<string, TodoView>();
+    initialTodos.forEach(t => byId.set(t.id, t));
+
+    for (let i = planIdx + 1; i < events.length; i++) {
+      const evt: any = events[i];
+      if (!evt || typeof evt !== 'object') continue;
+      if (evt.type === 'todo_update' && evt.id) {
+        const id = String(evt.id).trim();
+        const status = String(evt.status || '').trim();
+        if (!id || !status) continue;
+        const existing = byId.get(id);
+        if (!existing) continue;
+        existing.status = status;
+        if (evt.label && String(evt.label).trim()) existing.label = String(evt.label).trim();
+      }
+    }
+
+    return initialTodos;
+  };
+
+  const extractPlanIntentFromEvents = (events?: AIStreamEvent[]): string => {
+    if (!events || events.length === 0) return '';
+    // Find the latest plan_intent tool result
+    for (let i = events.length - 1; i >= 0; i--) {
+      const evt: any = events[i];
+      if (!evt || typeof evt !== 'object') continue;
+      if (evt.type === 'tool_result' && evt.tool === 'llm.plan_intent') {
+        const plan = evt.plan;
+        const intent =
+          (plan && typeof plan === 'object' && typeof plan.intent === 'string' && plan.intent.trim())
+            ? plan.intent.trim()
+            : (typeof evt.intent_preview === 'string' ? evt.intent_preview.trim() : '');
+        return intent || '';
+      }
+    }
+    return '';
   };
 
   const getApplyingElementIds = (events?: AIStreamEvent[]): string[] => {
@@ -776,6 +839,12 @@ export default function AIChat({
             if (fromEvents.length > 0) return fromEvents;
             return progressSource ? extractProgressSteps(progressSource) : [];
           })();
+          const todoItems = (() => {
+            if (!(mode === 'edit' || mode === 'ask')) return [];
+            return extractTodosFromEvents(msg.events);
+          })();
+          const planIntentText = mode === 'edit' ? extractPlanIntentFromEvents(msg.events) : '';
+          const planIntentDisplay = planIntentText ? `Plan: ${planIntentText}` : '';
           const applyingElementIds = isStreamingEdit ? getApplyingElementIds(msg.events) : [];
           
           // Get all elements being edited - from completed edits or detected during streaming
@@ -845,20 +914,52 @@ export default function AIChat({
                 {msg.role === 'user' ? <User size={14} /> : <Bot size={14} />}
               </div>
               <div className="ai-message-bubble">
-                {/* Progress timeline (Cursor-like) */}
-                {(isStreamingEdit || isStreamingAsk) && progressSteps.length > 0 && (
-                  <div className="ai-progress">
-                    {progressSteps.map((line, idx) => {
-                      const isActive = idx === progressSteps.length - 1;
+                {/* Plan intent (edit loop): show as assistant text above todos/progress */}
+                {msg.role === 'assistant' && mode === 'edit' && planIntentDisplay && (
+                  <div
+                    className="ai-message-content ai-plan-intent"
+                    dangerouslySetInnerHTML={{ __html: marked.parse(planIntentDisplay) as string }}
+                  />
+                )}
+
+                {/* Todos checklist (Cursor-like) */}
+                {(isStreamingEdit || isStreamingAsk) && todoItems.length > 0 && (
+                  <div className="ai-todos">
+                    {todoItems.map((t) => {
+                      const status = t.status;
+                      const isDone = status === 'done';
+                      const isActive = status === 'in_progress';
+                      const isSkipped = status === 'skipped';
                       return (
                         <div
-                          key={`${idx}-${line}`}
-                          className={`ai-progress-line ${isActive ? 'ai-progress-line--active' : ''}`}
+                          key={t.id}
+                          className={`ai-todo ai-todo--${status}`}
+                          title={status}
                         >
-                          {line}
+                          <span className="ai-todo-icon">
+                            {isDone ? (
+                              <Check size={14} />
+                            ) : isActive ? (
+                              <Loader2 size={14} className="ai-todo-spinner" />
+                            ) : isSkipped ? (
+                              <span className="ai-todo-skip">–</span>
+                            ) : (
+                              <span className="ai-todo-dot" />
+                            )}
+                          </span>
+                          <span className="ai-todo-label">{t.label}</span>
                         </div>
                       );
                     })}
+                  </div>
+                )}
+
+                {/* Progress timeline (Cursor-like): show only the current step (latest) */}
+                {(isStreamingEdit || isStreamingAsk) && progressSteps.length > 0 && (
+                  <div className="ai-progress">
+                    <div className="ai-progress-line ai-progress-line--active">
+                      {progressSteps[progressSteps.length - 1]}
+                    </div>
                   </div>
                 )}
 
@@ -935,18 +1036,7 @@ export default function AIChat({
           <div className="ai-context-chip">
             <div className="ai-context-line">{selectionLabel}</div>
           </div>
-          {(beats?.length || 0) > 0 && (
-            <button
-              type="button"
-              className="ai-context-btn"
-              onClick={() => setIncludeBeats(v => !v)}
-              title={includeBeats ? 'Beats are included in AI context' : 'Beats are excluded from AI context'}
-            >
-              <span style={{ fontSize: 12, opacity: 0.9 }}>
-                Beats: {includeBeats ? 'On' : 'Off'}
-              </span>
-            </button>
-          )}
+          {/* Beats are always included; no toggle. */}
         </div>
 
         {pendingEditList.length > 0 && (

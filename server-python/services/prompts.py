@@ -137,7 +137,35 @@ Analyze the user's request and determine:
 3. The scope of the change (single element, multiple elements, entire scene)
 4. The creative intent behind the request
 
-Return a clear, structured analysis of the edit intent in plain text."""
+Return ONLY JSON with this exact shape:
+{
+  "intent": "clear, structured analysis of the edit intent in plain text",
+  "next_action": "proceed" | "clarify",
+  "clarifying_questions": ["..."],
+  "todos": [
+    {"id": "plan_intent", "label": "Understand edit intent"},
+    {"id": "clarify", "label": "Ask clarifying questions"},
+    {"id": "locate", "label": "Locate relevant elements"},
+    {"id": "load_context", "label": "Load minimal relevant context"},
+    {"id": "synthesize", "label": "Synthesize understanding"},
+    {"id": "propose", "label": "Propose edits"},
+    {"id": "refine", "label": "Refine edits"},
+    {"id": "verify", "label": "Verify constraints"}
+  ]
+}
+
+Rules:
+- todos must be 3 to 8 items
+- ids must come from this allowed set:
+  plan_intent | clarify | locate | load_context | synthesize | propose | refine | verify | finish
+- next_action:
+  - Use "clarify" when the request is ambiguous (missing target character/scene, unclear desired change, conflicting constraints).
+  - Use "proceed" when you have enough information to start locating elements.
+- clarifying_questions:
+  - When next_action="clarify", include 1 to 3 short questions.
+  - Otherwise, return an empty array.
+- Use short, user-friendly labels.
+- Output JSON only (no markdown, no commentary)."""
 
 
 EXTRACT_SEARCH_TERMS_PROMPT = """You are an expert at analyzing screenplay edit requests. Your task is to extract key search terms that will help find relevant screenplay elements.
@@ -280,6 +308,10 @@ You will receive:
 
 Select the best evidence elements to answer the question.
 
+CRITICAL:
+- Do NOT answer the user question.
+- Return ONLY JSON. No prose, no markdown, no explanations outside the JSON fields.
+
 Return ONLY JSON with this exact shape:
 {
   "selectedElementIds": ["id1", "id2", "..."],
@@ -304,6 +336,10 @@ You will receive:
 
 Decide whether the context contains enough evidence to answer accurately.
 
+CRITICAL:
+- Do NOT answer the user question.
+- Return ONLY JSON. No prose, no markdown.
+
 Return ONLY JSON with this exact shape:
 {
   "grounded": true,
@@ -314,6 +350,78 @@ Return ONLY JSON with this exact shape:
 Rules:
 - If evidence is insufficient/ambiguous, set grounded=false and next_action=\"retrieve_more\".
 - missing should list what is needed (short phrases).
+"""
+
+# ============================================================
+# Ask planning (generic): coverage targets + query variants + outline
+# ============================================================
+
+ASK_PLAN_PROMPT = """You are a planning module for a screenplay Q&A assistant.
+
+You will receive JSON with:
+- question: the user question
+- selectedText: optional selected text
+- globalIndex: optional global index (scene list with sceneId=... and character summary)
+- globalIndexScenes: optional structured list of scenes from the global index:
+  [{"sceneId":"...","heading":"..."}]
+
+Your job:
+1) Infer the user's intent and what MUST be covered to fully answer.
+2) Produce retrieval guidance that improves evidence coverage (not just precision).
+
+CRITICAL:
+- Do NOT answer the user question.
+- Return ONLY JSON (exact schema below). No prose, no markdown.
+
+Return ONLY JSON with this exact shape:
+{
+  "todos": [
+    {"id": "plan", "label": "Understand the question"},
+    {"id": "clarify", "label": "Ask clarifying questions"},
+    {"id": "retrieve", "label": "Retrieve relevant evidence"},
+    {"id": "answer", "label": "Write the answer"}
+  ],
+  "intent": "short plain-text intent",
+  "next_action": "retrieve" | "answer_direct" | "clarify",
+  "use_context": true,
+  "clarifying_questions": ["..."],
+  "coverage": {
+    "must_include_scene_ids": ["..."],
+    "must_include_element_ids": ["..."]
+  },
+  "query_variants": ["..."],
+  "answer_outline": ["..."]
+}
+
+Rules:
+- todos:
+  - 2 to 7 items
+  - ids must come from this allowed set:
+    plan | clarify | retrieve | rerank | grounding | answer
+  - Use "retrieve"/"rerank"/"grounding" only when next_action=\"retrieve\".
+  - Use "clarify" only when next_action=\"clarify\".
+- next_action:
+  - Use "answer_direct" when the user question can be answered without retrieving screenplay evidence
+    (e.g., general screenwriting questions, formatting rules, process questions).
+  - Use "retrieve" when answering should be grounded in screenplay content.
+  - Use "clarify" when the question is ambiguous and you need user input to proceed.
+- use_context:
+  - When next_action="answer_direct", set use_context=false ONLY when the user is clearly asking a general question not about the current screenplay.
+  - If globalIndex or globalIndexScenes is provided, assume the question refers to the current screenplay and prefer use_context=true.
+- clarifying_questions:
+  - When next_action="clarify", include 1 to 3 short questions.
+  - Otherwise, return an empty array.
+- If the question implies exhaustive coverage (e.g., "each/every/all scenes", "list all..."),
+  include ALL relevant sceneIds from the provided globalIndexScenes (or globalIndex) in must_include_scene_ids.
+- If the globalIndex is missing, leave must_include_scene_ids empty and compensate with query_variants.
+- query_variants MUST include the original question verbatim as item 1.
+- Keep queries short and concrete (<= 200 chars each).
+- Do not invent IDs; only output IDs that appear in the provided input.
+
+Important:
+- Prefer `globalIndexScenes` when present (it is authoritative and already parsed).
+- When the user asks about scenes, and globalIndexScenes is present, you MUST base must_include_scene_ids on those sceneId values (do not leave it empty).
+- Treat short follow-ups (e.g., "characters", "that scene", "the last one") as referring to the current screenplay when globalIndex is present.
 """
 
 

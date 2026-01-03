@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback } from 'react';
+import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import { X, ChevronLeft, ChevronRight, Printer, ZoomIn, ZoomOut } from 'lucide-react';
 import { Screenplay } from '../types';
 import { calculatePages, Page } from '../utils/pageBreaks';
@@ -13,16 +13,79 @@ interface PrintPreviewProps {
 export default function PrintPreview({ isOpen, onClose, screenplay }: PrintPreviewProps) {
   const [currentPageIndex, setCurrentPageIndex] = useState(0);
   const [zoom, setZoom] = useState(100);
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const pageRefs = useRef<Array<HTMLDivElement | null>>([]);
+  const observerRef = useRef<IntersectionObserver | null>(null);
 
-  const pages = useMemo(() => calculatePages(screenplay.elements), [screenplay.elements]);
+  const scriptPages = useMemo(() => calculatePages(screenplay.elements), [screenplay.elements]);
+  const pages = useMemo(
+    () => [{ kind: 'title' as const }, ...scriptPages.map(p => ({ kind: 'script' as const, page: p }))],
+    [scriptPages]
+  );
 
-  const goToPreviousPage = useCallback(() => {
-    setCurrentPageIndex(prev => Math.max(0, prev - 1));
+  useEffect(() => {
+    if (!isOpen) return;
+    // Reset state on open so title page is always shown first.
+    setCurrentPageIndex(0);
+    setZoom(100);
+  }, [isOpen]);
+
+  // Observe which page is currently in view so scroll updates the active thumbnail.
+  useEffect(() => {
+    if (!isOpen) return;
+    const container = scrollContainerRef.current;
+    if (!container) return;
+
+    observerRef.current?.disconnect();
+    observerRef.current = new IntersectionObserver(
+      (entries) => {
+        // Pick the most visible page.
+        const visible = entries
+          .filter(e => e.isIntersecting)
+          .sort((a, b) => (b.intersectionRatio || 0) - (a.intersectionRatio || 0))[0];
+        if (!visible) return;
+        const idxAttr = (visible.target as HTMLElement).getAttribute('data-page-idx');
+        const idx = idxAttr ? parseInt(idxAttr, 10) : NaN;
+        if (!Number.isNaN(idx)) setCurrentPageIndex(idx);
+      },
+      { root: container, threshold: [0.25, 0.5, 0.75] }
+    );
+
+    // Attach observers to wrappers.
+    pageRefs.current.forEach((el, idx) => {
+      if (!el) return;
+      el.setAttribute('data-page-idx', String(idx));
+      observerRef.current?.observe(el);
+    });
+
+    return () => observerRef.current?.disconnect();
+  }, [isOpen, pages.length]);
+
+  const scrollToPage = useCallback((idx: number) => {
+    const container = scrollContainerRef.current;
+    const el = pageRefs.current[idx];
+    if (!container || !el) return;
+    const containerRect = container.getBoundingClientRect();
+    const elRect = el.getBoundingClientRect();
+    const delta = elRect.top - containerRect.top;
+    container.scrollTo({ top: container.scrollTop + delta, behavior: 'smooth' });
   }, []);
 
+  const goToPreviousPage = useCallback(() => {
+    setCurrentPageIndex(prev => {
+      const next = Math.max(0, prev - 1);
+      scrollToPage(next);
+      return next;
+    });
+  }, [scrollToPage]);
+
   const goToNextPage = useCallback(() => {
-    setCurrentPageIndex(prev => Math.min(pages.length - 1, prev + 1));
-  }, [pages.length]);
+    setCurrentPageIndex(prev => {
+      const next = Math.min(pages.length - 1, prev + 1);
+      scrollToPage(next);
+      return next;
+    });
+  }, [pages.length, scrollToPage]);
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
     if (e.key === 'ArrowLeft') goToPreviousPage();
@@ -42,9 +105,44 @@ export default function PrintPreview({ isOpen, onClose, screenplay }: PrintPrevi
     setZoom(prev => Math.max(50, prev - 25));
   }, []);
 
-  const renderPage = (page: Page) => {
+  const renderTitlePage = () => {
+    const title = (screenplay.title || 'Untitled Screenplay').toUpperCase();
+    const author = screenplay.author || 'Anonymous';
+    const basedOn = (screenplay.basedOn || '').trim();
+    const contact = (screenplay.contact || '').trim();
+    const draftDate = (screenplay.draftDate || '').trim();
+    const copyright = (screenplay.copyright || '').trim();
+
     return (
-      <div className="print-page" style={{ transform: `scale(${zoom / 100})` }}>
+      <div className="print-page print-title-page">
+        <div className="print-title-center">
+          <div className="print-title-text">{title}</div>
+          {basedOn && <div className="print-based-on">{basedOn}</div>}
+          <div className="print-written-by">Written by</div>
+          <div className="print-author-text">{author}</div>
+        </div>
+
+        <div className="print-title-bottom">
+          <div className="print-title-bottom-left">
+            {contact &&
+              contact.split('\n').map((line, idx) => (
+                <div key={idx} className="print-title-line">
+                  {line}
+                </div>
+              ))}
+          </div>
+          <div className="print-title-bottom-right">
+            {draftDate && <div className="print-title-line">{draftDate}</div>}
+            {copyright && <div className="print-title-line">{copyright}</div>}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderScriptPage = (page: Page) => {
+    return (
+      <div className="print-page">
         {/* Page header */}
         <div className="print-page-header">
           <span className="page-number">{page.pageNumber}.</span>
@@ -121,7 +219,7 @@ export default function PrintPreview({ isOpen, onClose, screenplay }: PrintPrevi
             <ChevronLeft size={20} />
           </button>
           <span className="page-indicator">
-            Page {currentPageIndex + 1} of {pages.length}
+            {currentPageIndex === 0 ? 'Title Page' : `Page ${currentPageIndex} of ${pages.length - 1}`}
           </span>
           <button 
             className="toolbar-btn"
@@ -151,27 +249,44 @@ export default function PrintPreview({ isOpen, onClose, screenplay }: PrintPrevi
       <div className="print-preview-sidebar">
         {pages.map((page, idx) => (
           <div
-            key={page.pageNumber}
+            key={page.kind === 'title' ? 'title' : page.page.pageNumber}
             className={`page-thumbnail ${idx === currentPageIndex ? 'active' : ''}`}
-            onClick={() => setCurrentPageIndex(idx)}
+            onClick={() => {
+              setCurrentPageIndex(idx);
+              scrollToPage(idx);
+            }}
           >
             <div className="thumbnail-content">
-              <span>{page.pageNumber}</span>
+              <span>{page.kind === 'title' ? 'T' : page.page.pageNumber}</span>
             </div>
           </div>
         ))}
       </div>
 
       {/* Main page view */}
-      <div className="print-preview-main">
-        <div className="page-container">
-          {pages[currentPageIndex] && renderPage(pages[currentPageIndex])}
+      <div className="print-preview-main" ref={scrollContainerRef}>
+        <div
+          className="page-container"
+          // `zoom` affects layout (unlike transform scale) so scrolling behaves naturally.
+          style={{ zoom: zoom / 100 } as React.CSSProperties}
+        >
+          {pages.map((p, idx) => (
+            <div
+              key={p.kind === 'title' ? 'title-wrapper' : `page-${p.page.pageNumber}`}
+              className="print-preview-page-wrapper"
+              ref={(el) => {
+                pageRefs.current[idx] = el;
+              }}
+            >
+              {p.kind === 'title' ? renderTitlePage() : renderScriptPage(p.page)}
+            </div>
+          ))}
         </div>
       </div>
 
       {/* Print-only styles for actual printing */}
       <div className="print-only-content">
-        {pages.map(page => renderPage(page))}
+        {pages.map(page => (page.kind === 'title' ? renderTitlePage() : renderScriptPage(page.page)))}
       </div>
     </div>
   );

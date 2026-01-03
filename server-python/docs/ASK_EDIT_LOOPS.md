@@ -65,7 +65,25 @@ flowchart TD
 
 Implementation: `server-python/services/ask_loop.py`
 
-1. **Start**: emits `[Start] Answering`.\n+2. **Retrieve (bounded attempts)**:\n+   - **Rewrite queries** (3–8 variants) for recall.\n+   - Runs `vec_search` for each query variant and dedupes candidate element IDs.\n+   - If vector returns nothing, falls back to `db_search` keyword retrieval.\n+   - If candidates exist and `ASK_RERANK_ENABLED` is on:\n+     - fetches candidate snippets\n+     - runs an **LLM reranker** to select the best evidence IDs\n+   - Builds the final evidence context window via `db_extract_context`.\n+   - If `ASK_GROUNDING_GATE` is on: runs a **grounding check**; if not grounded, broadens and retries.\n+   - If no DB retrieval worked, falls back to the request’s `sceneContext`.
+1. **Plan (optional)**:
+   - If `ASK_PLAN_ENABLED` is on, runs `llm.ask_plan` first.
+   - The planner returns:
+     - `next_action`: `"retrieve"` or `"answer_direct"` (skip retrieval entirely for general questions)
+     - `coverage.must_include_*`: IDs to force into evidence selection (coverage)
+     - `query_variants`: additional retrieval queries (merged with rewrite step)
+     - `answer_outline`: suggested structure for the final response
+2. **Retrieve (bounded attempts)**:
+   - If `next_action="answer_direct"`, skip retrieval and proceed to answer.
+   - Otherwise:
+     - **Rewrite queries** (3–8 variants) for recall.
+     - Runs `vec_search` for each query variant and dedupes candidate element IDs.
+     - If vector returns nothing, falls back to `db_search` keyword retrieval.
+     - If candidates exist and `ASK_RERANK_ENABLED` is on:
+       - fetches candidate snippets
+       - runs an **LLM reranker** to select the best evidence IDs
+     - Builds the final evidence context window via `db_extract_context`.
+     - If `ASK_GROUNDING_GATE` is on: runs a **grounding check**; if not grounded, broadens and retries.
+     - If no DB retrieval worked, falls back to the request’s `sceneContext`.
 3. **Answer**:
    - Uses `ask_agent` with `ChatDeps(scene_context=<retrieved>)`.
    - Emits `[Writing] Drafting response`.
@@ -159,6 +177,11 @@ The solution is:
 ## Feature flags
 - `ASK_RERANK_ENABLED` (default: true): enable LLM reranking in ask retrieval.
 - `ASK_GROUNDING_GATE` (default: true): enable grounding gate before answering.
+- `ASK_PLAN_ENABLED` (default: true): run an ask planning step before retrieval to improve coverage (must-include IDs + query variants + answer outline).
+- `ASK_PLAN_MUST_INCLUDE_MAX` (default: 12): cap how many must-include IDs the planner can force into retrieval.
+- `EMBED_AUTO_ON_DEMAND` (default: true): if a request attempts `vec_search` and the project has 0 embeddings stored, kick off a background embedding backfill so future requests can use vector retrieval.
+- `EMBED_AUTO_MIN_INTERVAL_SECONDS` (default: 60): cooldown to avoid repeatedly scheduling backfills on hot projects.
+- `EMBED_STALE_GRACE_SECONDS` (default: 5): treat embeddings as stale only if they lag the project `updated_at` by more than this grace window.
 - `EDIT_VERIFY_RECOVER` (default: true): enable structured verification + recovery (only on verify failure).
 
 This preserves backward compatibility while enabling rich UI (ephemeral steps, “Edit Dialogue” pill, etc.).

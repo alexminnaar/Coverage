@@ -41,6 +41,25 @@ def format_buffer_item(buffer_item: Any, stream_events: bool) -> Optional[str]:
             return format_status_text(str(msg))
         return None
 
+    if evt_type == "plan_todos":
+        todos = buffer_item.get("todos") or []
+        if isinstance(todos, list) and todos:
+            labels = []
+            for t in todos[:8]:
+                if isinstance(t, dict) and t.get("label"):
+                    labels.append(str(t.get("label")))
+            if labels:
+                return format_status_text("[Plan] " + " → ".join(labels))
+        return None
+
+    if evt_type == "todo_update":
+        tid = buffer_item.get("id") or ""
+        status = buffer_item.get("status") or ""
+        label = buffer_item.get("label") or tid
+        if tid and status:
+            return format_status_text(f"[Todo] {label}: {status}")
+        return None
+
     # Minimal legacy mapping for apply markers so old clients still see \"editing\" progress.
     if evt_type == "apply_started":
         label = buffer_item.get("label") or "Applying edits"

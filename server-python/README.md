@@ -30,7 +30,7 @@ Python implementation of the AI service using FastAPI, running alongside the Nod
 - **PORT**: Server port (default: 3002 for testing alongside Node.js on 3001)
 - **OPENAI_API_KEY**: Your OpenAI API key
 - **EDIT_LOOP_ENABLED**: Enable the Cursor-like explicit edit loop (default: `1`).
-  - Set to `0`/`false` to fall back to the legacy graph-based edit flow.
+  - Set to `0`/`false` to use the legacy single-pass edit agent (no multi-step loop).
 
 ## Edit mode streaming
 
