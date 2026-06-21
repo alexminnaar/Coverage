@@ -52,10 +52,27 @@ async def test_database_connection():
     return True
 
 
-async def test_query_elements(project_id: str):
-    """Test 2: Query elements by search terms"""
+async def test_list_scenes(project_id: str):
+    """Test 2b: List scene headings"""
     print("\n" + "=" * 60)
-    print("Test 2: Query Elements by Search Terms")
+    print("Test 2b: List Scenes")
+    print("=" * 60)
+
+    if not project_id:
+        print("⚠️  Skipping: No project_id provided")
+        return
+
+    scenes = await llm_service._list_scenes(project_id, limit=10)
+    print(f"✅ Found {len(scenes)} scene(s)")
+    if scenes:
+        first = scenes[0]
+        print(f"   First scene: #{first['scene_number']} — {first['heading'][:60]}")
+
+
+async def test_query_elements(project_id: str):
+    """Test 2: Full-text search over elements"""
+    print("\n" + "=" * 60)
+    print("Test 2: Full-Text Element Search")
     print("=" * 60)
     
     if not project_id:
@@ -63,23 +80,23 @@ async def test_query_elements(project_id: str):
         print("   Usage: python test_db_integration.py <project_id>")
         return
     
-    # Test search for common terms
     search_terms = ['John', 'Sarah', 'INT.', 'EXT.']
     print(f"Searching for: {search_terms}")
     
-    element_ids = await llm_service._query_elements_by_search(
+    hits = await llm_service._search_elements(
         project_id,
         search_terms,
-        element_types=['dialogue', 'character', 'scene-heading']
+        element_types=['dialogue', 'character', 'scene-heading'],
     )
     
-    print(f"✅ Found {len(element_ids)} matching elements")
-    if element_ids:
-        print(f"   First 5 IDs: {element_ids[:5]}")
+    print(f"✅ Found {len(hits)} matching elements")
+    if hits:
+        print(f"   First hit: {hits[0]['element_id'][:8]}... ({hits[0]['element_type']})")
+        print(f"   Snippet: {hits[0]['snippet'][:80]}")
     else:
         print("   ⚠️  No elements found. Try different search terms or check project_id")
     
-    return element_ids
+    return [h["element_id"] for h in hits]
 
 
 async def test_extract_context(project_id: str, element_ids: list):
@@ -164,11 +181,12 @@ async def test_full_flow(project_id: str):
     
     # Simulate step 1: Find elements with "John"
     print("\nStep 1: Searching for 'John'...")
-    element_ids = await llm_service._query_elements_by_search(
+    hits = await llm_service._search_elements(
         project_id,
         ['John'],
         element_types=['dialogue', 'character']
     )
+    element_ids = [h["element_id"] for h in hits]
     
     if element_ids:
         print(f"   ✅ Found {len(element_ids)} elements")
@@ -211,6 +229,7 @@ async def main():
     
     # Test 2-4: Query operations (require project_id)
     if project_id:
+        await test_list_scenes(project_id)
         element_ids = await test_query_elements(project_id)
         await test_extract_context(project_id, element_ids)
         await test_verify_element_ids(project_id, element_ids)

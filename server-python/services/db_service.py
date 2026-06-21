@@ -3,12 +3,43 @@ from __future__ import annotations
 import os
 import json
 import logging
+import time
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple
 
 import asyncpg
 
+from services.search_helpers import build_tsquery, make_snippet, normalize_search_terms
+
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SearchHit:
+    element_id: str
+    element_type: str
+    element_index: int
+    content: str
+    rank: float
+    snippet: str
+
+
+@dataclass
+class SceneSummary:
+    element_id: str
+    element_index: int
+    heading: str
+    scene_number: int
+
+
+@dataclass
+class CharacterSceneMatch:
+    scene_id: str
+    scene_number: int
+    element_index: int
+    heading: str
+    match_count: int
+    sample_matches: List[str]
 
 
 @dataclass
@@ -59,47 +90,320 @@ class DBService:
             logger.warning(f"⚠️  Database connection failed: {e}. Graph will use fallback mode.")
             self.pool = None
 
+    async def search_elements(
+        self,
+        project_id: str,
+        *,
+        terms: List[str],
+        match_mode: str = "any",
+        element_types: Optional[List[str]] = None,
+        limit: int = 25,
+    ) -> List[SearchHit]:
+        """Full-text search over screenplay elements with ILIKE fallback."""
+        await self.ensure_pool()
+        if not self.pool:
+            logger.info("[DB Search] No database pool available for element search")
+            return []
+
+        cleaned_terms = normalize_search_terms(terms)
+        if not cleaned_terms:
+            return []
+
+        mode = "all" if match_mode == "all" else "any"
+        limit = max(1, min(int(limit), 50))
+
+        hits = await self._search_elements_fts(
+            project_id,
+            cleaned_terms,
+            match_mode=mode,
+            element_types=element_types,
+            limit=limit,
+        )
+        if not hits:
+            hits = await self._search_elements_ilike(
+                project_id,
+                cleaned_terms,
+                match_mode=mode,
+                element_types=element_types,
+                limit=limit,
+            )
+        return hits
+
+    async def _search_elements_fts(
+        self,
+        project_id: str,
+        terms: List[str],
+        *,
+        match_mode: str,
+        element_types: Optional[List[str]],
+        limit: int,
+    ) -> List[SearchHit]:
+        tsquery = build_tsquery(terms, match_mode)
+        if not tsquery:
+            return []
+
+        try:
+            query = """
+                WITH indexed_elements AS (
+                    SELECT
+                        elem->>'id' AS element_id,
+                        elem->>'type' AS element_type,
+                        (ordinality - 1)::int AS element_index,
+                        COALESCE(elem->>'content', '') AS content
+                    FROM projects p,
+                         LATERAL jsonb_array_elements(p.data->'elements') WITH ORDINALITY t(elem, ordinality)
+                    WHERE p.id = $1::uuid
+                ),
+                filtered AS (
+                    SELECT
+                        element_id,
+                        element_type,
+                        element_index,
+                        content,
+                        to_tsvector('simple', content) AS tsv
+                    FROM indexed_elements
+                    WHERE ($3::text[] IS NULL OR element_type = ANY($3::text[]))
+                )
+                SELECT
+                    element_id,
+                    element_type,
+                    element_index,
+                    content,
+                    ts_rank(filtered.tsv, query) AS rank
+                FROM filtered,
+                     to_tsquery('simple', $2) AS query
+                WHERE filtered.tsv @@ query
+                ORDER BY rank DESC, element_index ASC
+                LIMIT $4
+            """
+            t0 = time.time()
+            rows = await self.pool.fetch(query, project_id, tsquery, element_types, limit)
+            dt_ms = int((time.time() - t0) * 1000)
+            logger.info(
+                f"[DB Search] FTS project_id={project_id[:8]}... terms={terms[:3]} "
+                f"mode={match_mode} rows={len(rows)} ({dt_ms}ms)"
+            )
+            return [
+                SearchHit(
+                    element_id=str(row["element_id"]),
+                    element_type=str(row["element_type"]),
+                    element_index=int(row["element_index"]),
+                    content=str(row["content"] or ""),
+                    rank=float(row["rank"] or 0.0),
+                    snippet=make_snippet(str(row["content"] or ""), terms),
+                )
+                for row in rows
+            ]
+        except Exception as e:
+            logger.warning(f"[DB Search] FTS failed, will try ILIKE: {type(e).__name__}: {e}")
+            return []
+
+    async def _search_elements_ilike(
+        self,
+        project_id: str,
+        terms: List[str],
+        *,
+        match_mode: str,
+        element_types: Optional[List[str]],
+        limit: int,
+    ) -> List[SearchHit]:
+        try:
+            patterns = [f"%{term}%" for term in terms]
+            content_clause = (
+                "(elem->>'content') ILIKE ALL($2::text[])"
+                if match_mode == "all"
+                else "(elem->>'content') ILIKE ANY($2::text[])"
+            )
+            query = f"""
+                WITH indexed_elements AS (
+                    SELECT
+                        elem,
+                        (ordinality - 1)::int AS element_index
+                    FROM projects p,
+                         LATERAL jsonb_array_elements(p.data->'elements') WITH ORDINALITY t(elem, ordinality)
+                    WHERE p.id = $1::uuid
+                )
+                SELECT
+                    elem->>'id' AS element_id,
+                    elem->>'type' AS element_type,
+                    element_index,
+                    COALESCE(elem->>'content', '') AS content
+                FROM indexed_elements
+                WHERE {content_clause}
+            """
+            params: List[object] = [project_id, patterns]
+            if element_types:
+                query += " AND (elem->>'type') = ANY($3::text[])"
+                params.append(element_types)
+            query += " ORDER BY element_index ASC LIMIT $%d" % (len(params) + 1)
+            params.append(limit)
+
+            t0 = time.time()
+            rows = await self.pool.fetch(query, *params)
+            dt_ms = int((time.time() - t0) * 1000)
+            logger.info(
+                f"[DB Search] ILIKE project_id={project_id[:8]}... terms={terms[:3]} "
+                f"mode={match_mode} rows={len(rows)} ({dt_ms}ms)"
+            )
+            return [
+                SearchHit(
+                    element_id=str(row["element_id"]),
+                    element_type=str(row["element_type"]),
+                    element_index=int(row["element_index"]),
+                    content=str(row["content"] or ""),
+                    rank=1.0,
+                    snippet=make_snippet(str(row["content"] or ""), terms),
+                )
+                for row in rows
+            ]
+        except Exception as e:
+            logger.error(f"[DB Search] ILIKE failed: {type(e).__name__}: {e}")
+            return []
+
+    async def list_scenes(
+        self,
+        project_id: str,
+        *,
+        search_terms: Optional[List[str]] = None,
+        limit: int = 50,
+    ) -> List[SceneSummary]:
+        """List scene headings in script order, optionally filtered by search terms."""
+        await self.ensure_pool()
+        if not self.pool:
+            return []
+
+        limit = max(1, min(int(limit), 100))
+
+        if search_terms:
+            hits = await self.search_elements(
+                project_id,
+                terms=search_terms,
+                match_mode="any",
+                element_types=["scene-heading"],
+                limit=limit,
+            )
+            all_scenes = await self.list_scenes(project_id, limit=500)
+            num_by_id = {s.element_id: s.scene_number for s in all_scenes}
+            return [
+                SceneSummary(
+                    element_id=h.element_id,
+                    element_index=h.element_index,
+                    heading=h.content.strip() or h.snippet,
+                    scene_number=num_by_id.get(h.element_id, i + 1),
+                )
+                for i, h in enumerate(hits)
+            ]
+
+        try:
+            query = """
+                WITH indexed_elements AS (
+                    SELECT
+                        elem->>'id' AS element_id,
+                        (ordinality - 1)::int AS element_index,
+                        COALESCE(elem->>'content', '') AS content
+                    FROM projects p,
+                         LATERAL jsonb_array_elements(p.data->'elements') WITH ORDINALITY t(elem, ordinality)
+                    WHERE p.id = $1::uuid
+                      AND elem->>'type' = 'scene-heading'
+                )
+                SELECT element_id, element_index, content
+                FROM indexed_elements
+                ORDER BY element_index ASC
+                LIMIT $2
+            """
+            rows = await self.pool.fetch(query, project_id, limit)
+            return [
+                SceneSummary(
+                    element_id=str(row["element_id"]),
+                    element_index=int(row["element_index"]),
+                    heading=str(row["content"] or "").strip() or "Untitled scene",
+                    scene_number=i + 1,
+                )
+                for i, row in enumerate(rows)
+            ]
+        except Exception as e:
+            logger.error(f"[DB Scenes] list_scenes failed: {type(e).__name__}: {e}")
+            return []
+
+    async def find_character_scenes(
+        self,
+        project_id: str,
+        terms: List[str],
+        *,
+        limit: int = 100,
+    ) -> List[CharacterSceneMatch]:
+        """Find scenes where character name terms appear in character/action/dialogue lines."""
+        cleaned = normalize_search_terms(terms)
+        if not cleaned:
+            return []
+
+        hits = await self.search_elements(
+            project_id,
+            terms=cleaned,
+            match_mode="any",
+            element_types=["character", "dialogue", "action"],
+            limit=max(1, min(int(limit), 150)),
+        )
+        if not hits:
+            return []
+
+        enriched = await self.fetch_elements_by_ids(project_id, [h.element_id for h in hits])
+        hit_by_id = {h.element_id: h for h in hits}
+        all_scenes = await self.list_scenes(project_id, limit=500)
+        num_by_id = {s.element_id: s.scene_number for s in all_scenes}
+        heading_by_id = {s.element_id: s.heading for s in all_scenes}
+
+        scenes: Dict[str, CharacterSceneMatch] = {}
+        for el in enriched:
+            eid = str(el.get("element_id") or "")
+            hit = hit_by_id.get(eid)
+            if not hit:
+                continue
+
+            scene_id = str(el.get("scene_id") or "")
+            heading = str(el.get("scene_heading") or "").strip()
+            etype = str(el.get("element_type") or hit.element_type)
+            if etype == "scene-heading":
+                scene_id = scene_id or eid
+                heading = heading or str(el.get("content") or "")
+
+            if not scene_id:
+                continue
+
+            if scene_id not in scenes:
+                scenes[scene_id] = CharacterSceneMatch(
+                    scene_id=scene_id,
+                    scene_number=num_by_id.get(scene_id, 0),
+                    element_index=int(el.get("element_index") or hit.element_index),
+                    heading=heading or heading_by_id.get(scene_id, "Unknown scene"),
+                    match_count=0,
+                    sample_matches=[],
+                )
+
+            match = scenes[scene_id]
+            match.match_count += 1
+            if len(match.sample_matches) < 3:
+                label = f"[{etype}] {hit.snippet}"
+                if label not in match.sample_matches:
+                    match.sample_matches.append(label)
+
+        return sorted(scenes.values(), key=lambda s: s.element_index)
+
     async def query_elements_by_search(
         self,
         project_id: str,
         search_terms: List[str],
         element_types: Optional[List[str]] = None,
     ) -> List[str]:
-        """Find element IDs matching search terms (ILIKE)."""
-        await self.ensure_pool()
-        if not self.pool:
-            logger.info("[DB Query] No database pool available for element search")
-            return []
-
-        try:
-            search_patterns = [f"%{term}%" for term in search_terms]
-            query = """
-                WITH elements AS (
-                    SELECT elem
-                    FROM projects p,
-                         LATERAL jsonb_array_elements(p.data->'elements') elem
-                    WHERE p.id = $1::uuid
-                )
-                SELECT DISTINCT elem->>'id' AS id
-                FROM elements
-                WHERE (elem->>'content') ILIKE ANY($2::text[])
-            """
-            params = [project_id, search_patterns]
-            if element_types:
-                query += " AND (elem->>'type') = ANY($3::text[])"
-                params.append(element_types)
-
-            logger.info(
-                f"[DB Query] Searching for elements: project_id={project_id[:8]}..., "
-                f"search_terms={search_terms[:3]}, element_types={element_types}"
-            )
-            rows = await self.pool.fetch(query, *params)
-            element_ids = [row["id"] for row in rows]
-            logger.info(f"[DB Query] ✅ Found {len(element_ids)} matching elements")
-            return element_ids
-        except Exception as e:
-            logger.error(f"[DB Query] ❌ Error querying elements: {type(e).__name__}: {e}")
-            return []
+        """Find element IDs matching search terms (legacy wrapper)."""
+        hits = await self.search_elements(
+            project_id,
+            terms=search_terms,
+            match_mode="any",
+            element_types=element_types,
+            limit=50,
+        )
+        return [hit.element_id for hit in hits]
 
     async def extract_element_context(
         self,

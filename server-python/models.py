@@ -33,6 +33,8 @@ class ChatRequest(BaseModel):
     globalIndex: Optional[str] = None
     mode: Optional[Literal['ask', 'edit']] = 'ask'
     projectId: Optional[str] = None  # UUID of the screenplay project
+    # Optional model override for chat agents (e.g., "gpt-4.1", "gpt-5", "gpt-5-mini").
+    model: Optional[str] = None
     # Selection/context metadata to help the backend reason about scope.
     selectedElementId: Optional[str] = None
     selectedText: Optional[str] = None
@@ -51,4 +53,29 @@ class HealthResponse(BaseModel):
 
 class CommandResponse(BaseModel):
     result: str
+
+
+class Beat(BaseModel):
+    id: str
+    title: str
+    description: str
+    actIndex: int
+    order: int
+    color: Optional[str] = None
+    linkedSceneId: Optional[str] = None
+
+
+class SceneSummary(BaseModel):
+    id: str
+    name: str
+
+
+class BeatChatRequest(BaseModel):
+    messages: List[ChatMessage]
+    beats: List[Beat]
+    actNames: List[str]
+    selectedBeatId: Optional[str] = None
+    scenes: Optional[List[SceneSummary]] = None
+    projectId: Optional[str] = None
+    model: Optional[str] = None
 

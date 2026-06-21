@@ -6,18 +6,19 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
+# Load environment variables BEFORE any service imports (they read env vars at
+# import time).
+load_dotenv()
+
 from models import (
     CompletionContext,
     ChatRequest,
     CommandRequest,
     HealthResponse,
-    CommandResponse
+    CommandResponse,
+    BeatChatRequest,
 )
 from services.llm_service import llm_service
-from services.observability.langfuse_client import langfuse_client
-
-# Load environment variables
-load_dotenv()
 
 app = FastAPI(title="Screenwriter AI Server", version="1.0.0")
 
@@ -46,6 +47,7 @@ async def root():
             "GET  /api/health - Health check",
             "POST /api/complete - Inline completion (streaming)",
             "POST /api/chat - Chat messages (streaming)",
+            "POST /api/beat-chat - Beat AI chat (streaming JSON ops)",
             "POST /api/command - Execute rewrite command",
         ]
     }
@@ -122,29 +124,7 @@ async def stream_chat(request: ChatRequest):
     messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
 
     async def generate():
-        trace_ctx = None
-        final_summary = None
         try:
-            trace_ctx = langfuse_client.start_trace(
-                name=f"chat.{request.mode or 'ask'}",
-                metadata={
-                    "projectId": request.projectId,
-                    "mode": request.mode or "ask",
-                    "streamEvents": request.streamEvents,
-                    "contextPolicy": request.contextPolicy,
-                    "hasGlobalIndex": bool(request.globalIndex),
-                    "selectedElementId": request.selectedElementId,
-                    "selectedTextLen": len(request.selectedText or ""),
-                    "sceneContextLen": len(request.sceneContext or ""),
-                    "globalIndexLen": len(request.globalIndex or ""),
-                },
-                input={
-                    "messages": messages,
-                    "sceneContext": request.sceneContext,
-                    "globalIndex": request.globalIndex,
-                },
-                tags=["ai-service", "chat"],
-            )
             async for chunk in llm_service.stream_chat(
                 messages,
                 request.sceneContext,
@@ -156,21 +136,27 @@ async def stream_chat(request: ChatRequest):
                 request.selectedText,
                 request.contextPolicy,
                 request.contextElementIds,
-                trace_ctx=trace_ctx,
+                request.model,
             ):
-                yield f"data: {json.dumps({'content': chunk})}\n\n"
-                # Best-effort store final output (typed events contain final payload)
-                if isinstance(chunk, str) and '"type": "final"' in chunk:
-                    final_summary = chunk[-4000:]
+                if request.streamEvents is False:
+                    yield f"data: {json.dumps({'content': chunk})}\n\n"
+                    continue
+
+                try:
+                    # Typed chat chunks are already app-level JSON events.
+                    parsed = json.loads(chunk)
+                    if isinstance(parsed, dict):
+                        yield f"data: {json.dumps(parsed)}\n\n"
+                    else:
+                        yield f"data: {json.dumps({'type': 'text_delta', 'content': str(chunk)})}\n\n"
+                except Exception:
+                    yield f"data: {json.dumps({'type': 'text_delta', 'content': chunk})}\n\n"
             yield "data: [DONE]\n\n"
         except Exception as stream_error:
-            langfuse_client.end_trace(trace_ctx, output={"error": str(stream_error), "final": final_summary})
-            langfuse_client.flush()
-            yield f"data: {json.dumps({'error': str(stream_error)})}\n\n"
-        finally:
-            if trace_ctx:
-                langfuse_client.end_trace(trace_ctx, output={"final": final_summary})
-                langfuse_client.flush()
+            if request.streamEvents is False:
+                yield f"data: {json.dumps({'error': str(stream_error)})}\n\n"
+            else:
+                yield f"data: {json.dumps({'type': 'error', 'error': str(stream_error)})}\n\n"
 
     return StreamingResponse(
         generate(),
@@ -182,42 +168,47 @@ async def stream_chat(request: ChatRequest):
     )
 
 
-@app.post("/api/embed/project/{project_id}")
-async def embed_project(project_id: str):
-    """Compute/upsert embeddings for a single project (best-effort)."""
+@app.post("/api/beat-chat")
+async def stream_beat_chat(request: BeatChatRequest):
+    """Beat AI chat response (streaming JSON ops only)"""
     if not llm_service.is_configured():
-        raise HTTPException(status_code=503, detail="AI not configured")
-    try:
-        result = await llm_service.embed_project_elements(project_id)
-        return {"status": "ok", **result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Embedding failed: {str(e)}")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "AI not configured",
+                "message": "Add OPENAI_API_KEY to server/.env file"
+            }
+        )
 
+    # Convert Pydantic models to dict for LLM service
+    messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+    beats = [{"id": b.id, "title": b.title, "description": b.description, "actIndex": b.actIndex, "order": b.order, "color": b.color, "linkedSceneId": b.linkedSceneId} for b in request.beats]
+    scenes = [{"id": s.id, "name": s.name} for s in (request.scenes or [])]
 
-@app.post("/api/embed/backfill")
-async def embed_backfill(projectId: Optional[str] = None):
-    """Backfill embeddings for one project or all projects (best-effort)."""
-    if not llm_service.is_configured():
-        raise HTTPException(status_code=503, detail="AI not configured")
-    await llm_service._ensure_db_pool()
-    if not llm_service.db_pool:
-        raise HTTPException(status_code=500, detail="Database not available")
+    async def generate():
+        try:
+            async for chunk in llm_service.stream_beat_chat(
+                messages,
+                beats,
+                request.actNames,
+                request.selectedBeatId,
+                scenes,
+                request.projectId,
+                request.model,
+            ):
+                yield f"data: {json.dumps({'content': chunk})}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as stream_error:
+            yield f"data: {json.dumps({'error': str(stream_error)})}\n\n"
 
-    try:
-        project_ids: List[str] = []
-        if projectId:
-            project_ids = [projectId]
-        else:
-            async with llm_service.db_pool.acquire() as conn:
-                rows = await conn.fetch("SELECT id::text AS id FROM projects ORDER BY updated_at DESC")
-                project_ids = [r["id"] for r in rows]
-
-        results: Dict[str, Any] = {}
-        for pid in project_ids:
-            results[pid] = await llm_service.embed_project_elements(pid)
-        return {"status": "ok", "projects": len(project_ids), "results": results}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Backfill failed: {str(e)}")
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive"
+        }
+    )
 
 
 @app.post("/api/command", response_model=CommandResponse)
@@ -247,4 +238,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "3002"))
     uvicorn.run(app, host="0.0.0.0", port=port)
-

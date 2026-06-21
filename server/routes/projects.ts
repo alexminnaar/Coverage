@@ -5,12 +5,6 @@ import { estimatePageCount } from '../utils/pageCount.js';
 
 const router = Router();
 
-function triggerProjectEmbedding(projectId: string): void {
-  // Best-effort: do not block the request. ai-service runs on the docker-compose network as `ai-service`.
-  const base = process.env.AI_SERVICE_URL || 'http://ai-service:3002';
-  fetch(`${base}/api/embed/project/${projectId}`, { method: 'POST' }).catch(() => {});
-}
-
 // Get all projects (metadata only)
 router.get('/', async (_req: Request, res: Response) => {
   try {
@@ -121,7 +115,6 @@ router.post('/', async (req: Request, res: Response) => {
       updatedAt: new Date(row.updated_at).getTime(),
     };
 
-    triggerProjectEmbedding(screenplay.id);
     res.status(201).json(created);
   } catch (error: any) {
     console.error('Error creating project:', error);
@@ -190,7 +183,6 @@ router.put('/:id', async (req: Request, res: Response) => {
         updatedAt: new Date(row.updated_at).getTime(),
       };
 
-      triggerProjectEmbedding(screenplay.id);
       return res.json(created);
     }
 
@@ -201,7 +193,6 @@ router.put('/:id', async (req: Request, res: Response) => {
       updatedAt: new Date(row.updated_at).getTime(),
     };
 
-    triggerProjectEmbedding(screenplay.id);
     res.json(updated);
   } catch (error) {
     console.error('Error updating project:', error);

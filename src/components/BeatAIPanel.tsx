@@ -10,7 +10,7 @@ import {
   Bot,
 } from 'lucide-react';
 import { Beat, ScriptElement } from '../types';
-import { useAIChat } from '../hooks/useAIChat';
+import { useBeatAIChat } from '../hooks/useBeatAIChat';
 
 const marked = new Marked();
 
@@ -153,9 +153,9 @@ export default function BeatAIPanel({
   isOpen,
   onClose,
   beats,
-  elements,
+  elements: _elements,
   projectId,
-  groundToScreenplay = false,
+  groundToScreenplay: _groundToScreenplay = false,
   actNames,
   scenes,
   selectedBeatId,
@@ -168,121 +168,16 @@ export default function BeatAIPanel({
   const [input, setInput] = useState('');
   const [plan, setPlan] = useState<BeatAIPlan | null>(null);
   const [includeSceneHeadings, setIncludeSceneHeadings] = useState(false);
+  const [model] = useState<string>('gpt-4.1');
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  const mappedElements = useMemo(
-    () => elements?.map(el => ({ id: el.id, type: el.type, content: el.content })),
-    [elements]
-  );
-
-  // IMPORTANT: Beat AI should default to *not* grounding against the screenplay DB/vector store.
-  // It should rely on the Beat Board context we build below (plus scene headings) unless explicitly enabled.
-  const { messages, isStreaming, error, sendMessage, clearMessages, stopStreaming } = useAIChat(
-    groundToScreenplay ? mappedElements : undefined,
-    groundToScreenplay ? projectId : undefined
-  );
+  // Use the new Beat AI hook
+  const { messages, isStreaming, error, sendMessage, clearMessages, stopStreaming } = useBeatAIChat();
 
   const selectedBeat = useMemo(
     () => beats.find((b) => b.id === selectedBeatId) || null,
     [beats, selectedBeatId]
   );
-
-  const orderedByAct = useMemo(() => {
-    return actNames.map((_, actIndex) =>
-      beats
-        .filter((b) => b.actIndex === actIndex)
-        .sort((a, b) => a.order - b.order)
-    );
-  }, [beats, actNames]);
-
-  const buildContext = () => {
-    const lines: string[] = [];
-
-    lines.push('Beat Board Context:');
-    actNames.forEach((actName, actIndex) => {
-      lines.push(`ACT ${actIndex + 1}: ${actName}`);
-      const actBeats = orderedByAct[actIndex].slice(0, 25); // keep concise but useful
-      actBeats.forEach((beat, idx) => {
-        const marker = beat.id === selectedBeatId ? '*FOCUS* ' : '';
-        lines.push(
-          `${marker}#${idx + 1} [id=${beat.id}] ${beat.title || 'Untitled'} — ${truncate(
-            beat.description || '',
-            140
-          )}`
-        );
-      });
-      if (orderedByAct[actIndex].length > actBeats.length) {
-        lines.push('… (more beats not shown)');
-      }
-      lines.push('');
-    });
-
-    if (selectedBeat) {
-      const sceneName = scenes.find((s) => s.id === selectedBeat.linkedSceneId)?.name;
-      lines.push('Selected Beat Details:');
-      lines.push(`id: ${selectedBeat.id}`);
-      lines.push(`actIndex: ${selectedBeat.actIndex}`);
-      lines.push(`order: ${selectedBeat.order}`);
-      lines.push(`title: ${selectedBeat.title || 'Untitled beat'}`);
-      lines.push(`description: ${selectedBeat.description || '(empty)'}`);
-      if (selectedBeat.color) {
-        lines.push(`color: ${selectedBeat.color}`);
-      }
-      if (sceneName) {
-        lines.push(`linkedScene: ${sceneName}`);
-      }
-      lines.push('');
-    }
-
-    // By default, Beat AI should not be "reading the screenplay".
-    // If enabled, we include scene headings only to allow linking beats to scenes by id.
-    if (includeSceneHeadings && scenes.length > 0) {
-      lines.push('Scene Headings (optional; for linking only):');
-      const limitedScenes = scenes.slice(0, 15);
-      lines.push(limitedScenes.map((s) => `[id=${s.id}] ${s.name}`).join(' | '));
-      if (scenes.length > limitedScenes.length) {
-        lines.push('… (more scenes not shown)');
-      }
-      lines.push('');
-    }
-
-    lines.push('Return ONLY one JSON object. Prefer this schema:');
-    lines.push(
-      JSON.stringify(
-        {
-          ops: [
-            {
-              op: 'update',
-              id: 'existing-beat-id',
-              updates: { title: '...', description: '...', linkedSceneId: 'optional', color: '#hex-optional' },
-              reason: 'optional',
-            },
-            {
-              op: 'create',
-              actIndex: 1,
-              insertAfterOrder: 2,
-              beat: { title: '...', description: '...', linkedSceneId: 'optional', color: '#hex-optional' },
-              reason: 'optional',
-            },
-            { op: 'move', id: 'existing-beat-id', targetActIndex: 1, targetOrder: 0, reason: 'optional' },
-            { op: 'delete', id: 'existing-beat-id', reason: 'optional' },
-          ],
-          notes: 'optional short plain text',
-        },
-        null,
-        2
-      )
-    );
-    lines.push('');
-    lines.push('Rules:');
-    lines.push('- Output MUST be valid JSON only (no prose).');
-    lines.push('- Use existing beat ids when updating/moving/deleting.');
-    lines.push('- Keep descriptions 1-2 sentences.');
-    lines.push('- Do not invent scene ids; only use the scene ids provided above.');
-    lines.push('- Keep ops to <= 12. If you need more, summarize in notes.');
-
-    return lines.join('\n');
-  };
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -296,7 +191,8 @@ export default function BeatAIPanel({
     const lastMsg = messages[messages.length - 1];
     if (lastMsg?.role === 'assistant' && lastMsg.content) {
       const parsedPlan = parseBeatPlan(lastMsg.content);
-      if (parsedPlan && parsedPlan.ops?.length) {
+      // Only set plan if there are actual operations to apply
+      if (parsedPlan && parsedPlan.ops && parsedPlan.ops.length > 0) {
         setPlan(parsedPlan);
         return;
       }
@@ -336,7 +232,13 @@ export default function BeatAIPanel({
             ],
           });
         }
+      } else {
+        // If no operations found, clear any existing plan to allow normal conversation
+        setPlan(null);
       }
+    } else {
+      // Clear plan when there's no assistant message or when starting new conversation
+      setPlan(null);
     }
   }, [messages, selectedBeat, onAddBeat, actNames.length]);
 
@@ -356,9 +258,16 @@ export default function BeatAIPanel({
     const text = prompt ?? input;
     if (!text.trim() || isStreaming) return;
     setPlan(null);
-    const context = buildContext();
-    // Keep the "JSON only" instruction in the context (so we don't pollute the visible user message).
-    sendMessage(text, context, 'ask');
+    // Pass structured beat data to the new endpoint (context building is now in backend)
+    sendMessage(
+      text,
+      beats,
+      actNames,
+      selectedBeatId,
+      includeSceneHeadings ? scenes : undefined,
+      projectId,
+      model
+    );
     if (!prompt) {
       setInput('');
     }
@@ -410,31 +319,6 @@ export default function BeatAIPanel({
     setPlan(null);
   };
 
-  const opLabel = (op: BeatOp): string => {
-    if (op.op === 'create') {
-      const title = (op.beat?.title || '').trim();
-      const name = title ? `“${truncate(title, 60)}”` : 'Untitled beat';
-      return `Create in Act ${op.actIndex + 1}${op.insertAfterOrder !== undefined ? ` after #${op.insertAfterOrder + 1}` : ''}: ${name}`;
-    }
-    if (op.op === 'update') {
-      const beat = beats.find(b => b.id === op.id);
-      const name = beat?.title ? `“${truncate(beat.title, 60)}”` : op.id;
-      const fields = Object.keys(op.updates || {}).join(', ') || 'fields';
-      return `Update ${name}: ${fields}`;
-    }
-    if (op.op === 'move') {
-      const beat = beats.find(b => b.id === op.id);
-      const name = beat?.title ? `“${truncate(beat.title, 60)}”` : op.id;
-      return `Move ${name} → Act ${op.targetActIndex + 1}, position ${op.targetOrder + 1}`;
-    }
-    // delete
-    {
-      const beat = beats.find(b => b.id === op.id);
-      const name = beat?.title ? `“${truncate(beat.title, 60)}”` : op.id;
-      return `Delete ${name}`;
-    }
-  };
-
   return (
     <div className="beat-ai-panel">
       <div className="beat-ai-header">
@@ -454,35 +338,39 @@ export default function BeatAIPanel({
         </div>
       </div>
 
-      <div className="beat-ai-selected">
-        <div className="beat-ai-selected-label" style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
-          <span>Selected beat</span>
-          <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, opacity: 0.8 }}>
+      <div className="beat-ai-messages">
+        {messages.length === 0 && (
+          <div className="beat-ai-welcome">
+            <div className="beat-ai-welcome-icon">
+              <Sparkles size={24} />
+            </div>
+            <h4>How can I help?</h4>
+            <p>Ask me anything about your beats, or try one of these:</p>
+
+            {selectedBeat ? (
+              <div className="beat-ai-selected-card">
+                <div className="beat-ai-selected-label">Selected Beat</div>
+                <div className="beat-ai-selected-title">{selectedBeat.title || 'Untitled beat'}</div>
+                <div className="beat-ai-selected-desc">
+                  {selectedBeat.description ? truncate(selectedBeat.description, 140) : 'No description yet.'}
+                </div>
+              </div>
+            ) : (
+              <div className="beat-ai-selected-empty-card">
+                Select a beat to target rewrites.
+              </div>
+            )}
+
+            <div className="beat-ai-settings-row">
+              <label>
             <input
               type="checkbox"
               checked={includeSceneHeadings}
               onChange={(e) => setIncludeSceneHeadings(e.target.checked)}
             />
-            Include scene headings (linking only)
+                <span>Include scene headings (linking only)</span>
           </label>
-        </div>
-        {selectedBeat ? (
-          <div className="beat-ai-selected-body">
-            <div className="beat-ai-selected-title">{selectedBeat.title || 'Untitled beat'}</div>
-            <div className="beat-ai-selected-desc">
-              {selectedBeat.description ? truncate(selectedBeat.description, 200) : 'No description yet.'}
             </div>
-          </div>
-        ) : (
-          <div className="beat-ai-selected-empty">Select a beat to target rewrites.</div>
-        )}
-      </div>
-
-      <div className="beat-ai-messages">
-        {messages.length === 0 && (
-          <div className="beat-ai-empty">
-            <Sparkles size={28} />
-            <p>Ask for beat rewrites, new beats, or structure notes.</p>
           </div>
         )}
         {messages.map((msg, idx) => {
@@ -516,19 +404,61 @@ export default function BeatAIPanel({
                     }}
                   ></div>
                 )}
-                {msg.role === 'assistant' && plan && idx === messages.length - 1 && (
+                {msg.role === 'assistant' && plan && plan.ops && plan.ops.length > 0 && idx === messages.length - 1 && (
                   <div className="beat-ai-suggestion">
                     <div className="beat-ai-suggestion-header">Proposed beat changes</div>
                     {plan.notes && <div className="beat-ai-suggestion-reason">{plan.notes}</div>}
                     <div className="beat-ai-suggestion-desc">
-                      {(plan.ops || []).slice(0, 20).map((op, i) => (
-                        <div key={i} style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 6 }}>
-                          <div style={{ flex: 1 }}>{opLabel(op)}</div>
-                          <button className="beat-ai-secondary" onClick={() => applyOp(op)}>
-                            Apply
-                          </button>
-                        </div>
-                      ))}
+                      {(plan.ops || []).slice(0, 20).map((op, i) => {
+                        let title = '';
+                        let description = '';
+                        let actionLabel = '';
+
+                        if (op.op === 'create') {
+                          title = (op.beat?.title || '').trim() || 'Untitled beat';
+                          description = (op.beat?.description || '').trim();
+                          actionLabel = `Create in Act ${op.actIndex + 1}${op.insertAfterOrder !== undefined ? ` after #${op.insertAfterOrder + 1}` : ''}`;
+                        } else if (op.op === 'update') {
+                          const beat = beats.find(b => b.id === op.id);
+                          title = (op.updates?.title || beat?.title || '').trim() || op.id;
+                          description = (op.updates?.description || beat?.description || '').trim();
+                          const fields = Object.keys(op.updates || {}).join(', ') || 'fields';
+                          actionLabel = `Update: ${fields}`;
+                        } else if (op.op === 'move') {
+                          const beat = beats.find(b => b.id === op.id);
+                          title = beat?.title || op.id;
+                          description = beat?.description || '';
+                          actionLabel = `Move to Act ${op.targetActIndex + 1}, position ${op.targetOrder + 1}`;
+                        } else if (op.op === 'delete') {
+                          const beat = beats.find(b => b.id === op.id);
+                          title = beat?.title || op.id;
+                          description = beat?.description || '';
+                          actionLabel = 'Delete';
+                        }
+
+                        return (
+                          <div key={i} style={{ marginTop: 12, padding: 12, background: 'var(--bg-secondary)', borderRadius: 6 }}>
+                            <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start', marginBottom: 8 }}>
+                              <div style={{ flex: 1 }}>
+                                <div style={{ fontSize: '0.875rem', fontWeight: 500, color: 'var(--text-primary)', marginBottom: 4 }}>
+                                  {actionLabel}
+                                </div>
+                                <div style={{ fontSize: '0.9375rem', fontWeight: 600, color: 'var(--text-primary)', marginBottom: description ? 4 : 0 }}>
+                                  {title}
+                                </div>
+                                {description && (
+                                  <div style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)', marginTop: 4, lineHeight: 1.4 }}>
+                                    {description}
+                                  </div>
+                                )}
+                              </div>
+                              <button className="beat-ai-secondary" onClick={() => applyOp(op)}>
+                                Apply
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
                       {plan.ops.length > 20 && <div style={{ marginTop: 8, opacity: 0.8 }}>… more ops not shown</div>}
                     </div>
                     <div className="beat-ai-suggestion-actions">

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { v4 as uuidv4 } from 'uuid';
-import { Screenplay, ScriptElement, ElementType, getDefaultNextType, ProjectMeta, Theme, Beat, BeatStructure, Revision, PendingEdit } from './types';
+import { Screenplay, ScriptElement, ElementType, getDefaultNextType, ProjectMeta, Theme, Beat, BeatStructure, BEAT_STRUCTURES, Revision, PendingEdit } from './types';
+import { applyBeatOps } from './utils/applyBeatOps';
 import {
   loadCurrentScreenplay,
   saveProject,
@@ -448,6 +449,17 @@ function App() {
     setScreenplay(prev => ({ ...prev, beats }));
   }, [setScreenplay]);
 
+  const handleApplyBeatOps = useCallback((ops: Parameters<typeof applyBeatOps>[1]) => {
+    setScreenplay(prev => {
+      const structure = prev.beatStructure || 'three-act';
+      const actCount = (BEAT_STRUCTURES[structure] ?? BEAT_STRUCTURES['three-act']).length;
+      return {
+        ...prev,
+        beats: applyBeatOps(prev.beats || [], ops, actCount),
+      };
+    });
+  }, [setScreenplay]);
+
   const handleBeatStructureChange = useCallback((beatStructure: BeatStructure) => {
     setScreenplay(prev => ({ ...prev, beatStructure }));
   }, [setScreenplay]);
@@ -840,6 +852,9 @@ function App() {
       // Cmd/Ctrl+/: Toggle AI Chat
       if (modKey && e.key === '/' && aiEnabled) {
         e.preventDefault();
+        if (showBeatBoard) {
+          return;
+        }
         setShowAIChat(prev => !prev);
         return;
       }
@@ -875,7 +890,7 @@ function App() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [undo, redo, toggleDistractionFree, toggleTypewriterMode, toggleFocusMode, distractionFree, aiEnabled, showAICommand, showAIChat]);
+  }, [undo, redo, toggleDistractionFree, toggleTypewriterMode, toggleFocusMode, distractionFree, aiEnabled, showAICommand, showAIChat, showBeatBoard]);
 
   const pageCount = estimatePageCount(screenplay);
 
@@ -975,13 +990,17 @@ function App() {
 
   const openBeatBoard = useCallback((beatId?: string) => {
     setBeatBoardSelectedBeatId(beatId ?? null);
+    setShowAIChat(false);
+    setShowAICommand(false);
     setShowBeatBoard(true);
   }, []);
 
-  // If Beat Board is open, show it instead of the main editor
-  if (showBeatBoard) {
-    return (
-      <div className={`app ${distractionFree ? 'distraction-free' : ''}`}>
+  return (
+    <div
+      className={`app ${showAIChat ? 'ai-chat-open' : ''} ${distractionFree ? 'distraction-free' : ''}`}
+      style={{ '--ai-panel-width': `${aiPanelWidth}px` } as React.CSSProperties}
+    >
+      {showBeatBoard ? (
         <BeatBoard
           projectId={screenplay.id}
           beats={screenplay.beats || []}
@@ -995,16 +1014,8 @@ function App() {
             setBeatBoardSelectedBeatId(null);
           }}
         />
-      </div>
-    );
-  }
-
-
-  return (
-    <div
-      className={`app ${showAIChat ? 'ai-chat-open' : ''}`}
-      style={{ '--ai-panel-width': `${aiPanelWidth}px` } as React.CSSProperties}
-    >
+      ) : (
+        <>
       <Header
         title={screenplay.title}
         author={screenplay.author}
@@ -1087,6 +1098,8 @@ function App() {
           />
         </div>
       </div>
+        </>
+      )}
       <KeyboardHelp isOpen={showHelp} onClose={() => setShowHelp(false)} />
       <FindReplace
         isOpen={showFindReplace}
@@ -1118,6 +1131,7 @@ function App() {
       />
 
       {/* AI Features */}
+      {!showBeatBoard && (
       <AIChat
         isOpen={showAIChat}
         onClose={() => setShowAIChat(false)}
@@ -1127,6 +1141,7 @@ function App() {
         // Prefer the editor's currently active element; fall back to navigator-driven focus.
         currentElementId={activeElementId ?? focusedElementId}
         onProposeEdits={handleProposeEdits}
+        onApplyBeatOps={handleApplyBeatOps}
         projectId={screenplay.id}
         pendingEdits={pendingEdits}
         onJumpToElement={handleFocusElement}
@@ -1135,6 +1150,7 @@ function App() {
         width={aiPanelWidth}
         onWidthChange={setAIPanelWidth}
       />
+      )}
       <AICommandPalette
         isOpen={showAICommand}
         onClose={() => setShowAICommand(false)}
