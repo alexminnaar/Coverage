@@ -1,5 +1,5 @@
 import { useMemo, useState, useCallback, useRef } from 'react';
-import { streamChat, ChatMessage, EditProposal, AIStreamEvent } from '../services/aiClient';
+import { streamChat, ChatMessage, EditProposal, AIStreamEvent, BeatOp } from '../services/aiClient';
 import { ElementType } from '../types';
 import { buildGlobalIndex } from '../utils/globalIndex';
 
@@ -16,6 +16,7 @@ interface UseAIChatResult {
       selectedText?: string | null;
       contextPolicy?: 'scene_plus_adjacent' | 'full';
       contextElementIds?: string[];
+      model?: string;
     }
   ) => Promise<void>;
   clearMessages: () => void;
@@ -129,60 +130,6 @@ function parseEditProposals(
   return edits;
 }
 
-// Extract complete JSON objects from a stream where objects may arrive concatenated (e.g. `}{`) or with whitespace.
-// This is used to robustly parse edit-mode typed events over streaming transport.
-function extractJsonObjects(input: string): { objects: string[]; remainder: string } {
-  const objects: string[] = [];
-  let start = -1;
-  let depth = 0;
-  let inString = false;
-  let escape = false;
-
-  for (let i = 0; i < input.length; i++) {
-    const ch = input[i];
-
-    if (start === -1) {
-      if (ch === '{') {
-        start = i;
-        depth = 1;
-        inString = false;
-        escape = false;
-      }
-      continue;
-    }
-
-    if (inString) {
-      if (escape) {
-        escape = false;
-      } else if (ch === '\\') {
-        escape = true;
-      } else if (ch === '"') {
-        inString = false;
-      }
-      continue;
-    }
-
-    if (ch === '"') {
-      inString = true;
-      continue;
-    }
-    if (ch === '{') {
-      depth++;
-      continue;
-    }
-    if (ch === '}') {
-      depth--;
-      if (depth === 0) {
-        objects.push(input.slice(start, i + 1));
-        start = -1;
-      }
-    }
-  }
-
-  const remainder = start === -1 ? '' : input.slice(start);
-  return { objects, remainder };
-}
-
 export function useAIChat(
   elements?: Array<{ id: string; type: ElementType; content: string }>,
   projectId?: string
@@ -215,6 +162,7 @@ export function useAIChat(
       selectedText?: string | null;
       contextPolicy?: 'scene_plus_adjacent' | 'full';
       contextElementIds?: string[];
+      model?: string;
     }
   ) => {
     if (!content.trim()) return;
@@ -244,9 +192,88 @@ export function useAIChat(
       const allMessages = [...messages, userMessage];
 
       let finalEdits: EditProposal[] | undefined = undefined;
-      let eventBuffer = '';
+      let finalBeatOps: BeatOp[] | undefined = undefined;
       let typedEvents: AIStreamEvent[] = [];
-      
+
+      const handleStreamEvent = (event: AIStreamEvent) => {
+        typedEvents.push(event);
+
+        if (event.type === 'text_delta' && (event as any).content) {
+          fullResponse += (event as any).content;
+          return;
+        }
+
+        if (event.type === 'status') {
+          return;
+        }
+
+        if (event.type === 'error' && (event as any).error) {
+          throw new Error(String((event as any).error));
+        }
+
+        if (event.type === 'final' && (event as any).edits) {
+          const editsPayload = (event as any).edits;
+          if (editsPayload.edits && Array.isArray(editsPayload.edits)) {
+            const rawEdits = editsPayload.edits;
+            finalEdits = rawEdits
+              .filter((edit: any) => {
+                const elementExists = elements?.some(el => el.id === edit.elementId);
+                return (
+                  edit.elementId &&
+                  edit.originalContent !== undefined &&
+                  edit.newContent !== undefined &&
+                  elementExists
+                );
+              })
+              .map((edit: any) => ({
+                elementId: edit.elementId,
+                elementType: edit.elementType || 'action',
+                originalContent: edit.originalContent || '',
+                newContent: edit.newContent || '',
+                reason: edit.reason,
+                newElements: edit.newElements,
+              }));
+          }
+          return;
+        }
+
+        if (event.type === 'final' && (event as any).beatOps) {
+          const beatPayload = (event as any).beatOps;
+          if (beatPayload.ops && Array.isArray(beatPayload.ops)) {
+            finalBeatOps = beatPayload.ops;
+          }
+          return;
+        }
+
+        if (event.type === 'final' && (event as any).content) {
+          // The final answer is authoritative and prevents duplicate deltas.
+          fullResponse = String((event as any).content);
+          return;
+        }
+
+        if (event && Array.isArray((event as any).edits)) {
+          // Legacy final payload shape: {"edits":[...]} (no typed wrapper)
+          finalEdits = (event as any).edits
+            .filter((edit: any) => {
+              const elementExists = elements?.some(el => el.id === edit.elementId);
+              return (
+                edit.elementId &&
+                edit.originalContent !== undefined &&
+                edit.newContent !== undefined &&
+                elementExists
+              );
+            })
+            .map((edit: any) => ({
+              elementId: edit.elementId,
+              elementType: edit.elementType || 'action',
+              originalContent: edit.originalContent || '',
+              newContent: edit.newContent || '',
+              reason: edit.reason,
+              newElements: edit.newElements,
+            }));
+        }
+      };
+
       for await (const chunk of streamChat(
         allMessages,
         sceneContext,
@@ -258,91 +285,10 @@ export function useAIChat(
           globalIndex,
         }
       )) {
-        // Edit mode: chunks may contain concatenated JSON events; parse robustly using a small stateful buffer.
-        if (mode === 'edit') {
-          eventBuffer += chunk;
-          const { objects, remainder } = extractJsonObjects(eventBuffer);
-          eventBuffer = remainder;
-
-          // If we couldn't extract any complete JSON objects, don't mutate fullResponse yet (likely partial JSON).
-          if (objects.length === 0) {
-            continue;
-          }
-
-          for (const objStr of objects) {
-        try {
-              const event = JSON.parse(objStr) as AIStreamEvent;
-              typedEvents.push(event);
-          
-          if (event.type === 'status') {
-                fullResponse += (event as any).message + '\n';
-              } else if (event.type === 'final' && (event as any).edits) {
-                const editsPayload = (event as any).edits;
-                if (editsPayload.edits && Array.isArray(editsPayload.edits)) {
-                  const rawEdits = editsPayload.edits;
-                  finalEdits = rawEdits
-                    .filter((edit: any) => {
-                const elementExists = elements?.some(el => el.id === edit.elementId);
-                      return (
-                        edit.elementId &&
-                        edit.originalContent !== undefined &&
-                        edit.newContent !== undefined &&
-                        elementExists
-                      );
-                    })
-                    .map((edit: any) => ({
-                elementId: edit.elementId,
-                elementType: edit.elementType || 'action',
-                originalContent: edit.originalContent || '',
-                newContent: edit.newContent || '',
-                reason: edit.reason,
-                newElements: edit.newElements,
-              }));
-            }
-              } else if (event && Array.isArray((event as any).edits)) {
-                // Legacy final payload shape: {"edits":[...]} (no typed wrapper)
-                finalEdits = (event as any).edits
-                  .filter((edit: any) => {
-                    const elementExists = elements?.some(el => el.id === edit.elementId);
-                    return (
-                      edit.elementId &&
-                      edit.originalContent !== undefined &&
-                      edit.newContent !== undefined &&
-                      elementExists
-                    );
-                  })
-                  .map((edit: any) => ({
-                    elementId: edit.elementId,
-                    elementType: edit.elementType || 'action',
-                    originalContent: edit.originalContent || '',
-                    newContent: edit.newContent || '',
-                    reason: edit.reason,
-                    newElements: edit.newElements,
-                  }));
-              } else {
-                // Non-status typed event; keep in typedEvents but don't add noise to transcript.
-              }
-            } catch (e) {
-              fullResponse += objStr;
-            }
-          }
+        if (typeof chunk === 'string') {
+          fullResponse += chunk;
         } else {
-          // Ask mode: typed events by default. We still tolerate plain text.
-          try {
-            const event = JSON.parse(chunk) as AIStreamEvent;
-            typedEvents.push(event);
-
-            if (event.type === 'status') {
-              fullResponse += (event as any).message + '\n';
-            } else if (event.type === 'final' && (event as any).content) {
-              // Final answer payload
-              fullResponse = String((event as any).content);
-            } else {
-              // decision/tool events: keep them in typedEvents, don't pollute transcript
-            }
-          } catch (e) {
-            fullResponse += chunk;
-          }
+          handleStreamEvent(chunk);
         }
         
         // Update the last message (assistant)
@@ -357,6 +303,7 @@ export function useAIChat(
               ...lastMsg,
               content: fullResponse,
               edits: edits.length > 0 ? edits : undefined,
+              beatOps: finalBeatOps?.length ? finalBeatOps : undefined,
               events: typedEvents
             };
           } else {
@@ -376,6 +323,7 @@ export function useAIChat(
             updated[updated.length - 1] = {
               ...lastMsg,
               edits: edits.length > 0 ? edits : lastMsg.edits,
+              beatOps: finalBeatOps?.length ? finalBeatOps : lastMsg.beatOps,
               events: typedEvents.length > 0 ? typedEvents : lastMsg.events
             };
           }
@@ -410,4 +358,3 @@ export function useAIChat(
     stopStreaming,
   };
 }
-

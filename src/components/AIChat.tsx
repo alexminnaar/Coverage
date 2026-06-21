@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useMemo } from 'react';
+import { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { Marked } from 'marked';
 import {
   X,
@@ -31,7 +31,7 @@ import {
   BeatStructure,
   BEAT_STRUCTURES,
 } from '../types';
-import type { AIStreamEvent } from '../services/aiClient';
+import type { AIStreamEvent, PlanState, TodoItem, BeatOp } from '../services/aiClient';
 
 interface AIChatProps {
   isOpen: boolean;
@@ -41,6 +41,7 @@ interface AIChatProps {
   beatStructure?: BeatStructure;
   currentElementId?: string | null;
   onProposeEdits: (edits: PendingEdit[]) => void;
+  onApplyBeatOps?: (ops: BeatOp[]) => void;
   pendingEdits?: Map<string, PendingEdit>;
   onJumpToElement?: (id: string) => void;
   onAcceptEdit?: (id: string) => void;
@@ -99,6 +100,7 @@ export default function AIChat({
   beatStructure,
   currentElementId,
   onProposeEdits,
+  onApplyBeatOps,
   pendingEdits,
   onJumpToElement,
   onAcceptEdit,
@@ -117,9 +119,57 @@ export default function AIChat({
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const [showEditList, setShowEditList] = useState(false);
+  const [dismissedBeatOpMessages, setDismissedBeatOpMessages] = useState<Set<number>>(new Set());
   const [selectionSnapshot, setSelectionSnapshot] = useState<string>('');
   const [activeTextareaElementId, setActiveTextareaElementId] = useState<string | null>(null);
   // Beats are always included in AI context (no toggle).
+
+  type AIModelOption = { id: string; label: string };
+  const DEFAULT_MODEL_ID = 'gpt-4.1';
+  const MODEL_OPTIONS: AIModelOption[] = [
+    { id: 'gpt-4.1', label: 'gpt-4.1' },
+    { id: 'gpt-5', label: 'gpt-5' },
+    { id: 'gpt-5-mini', label: 'gpt-5-mini' },
+  ];
+
+  const getStoredModel = (): string => {
+    try {
+      const v = localStorage.getItem('screenwriter_ai_model');
+      if (v && MODEL_OPTIONS.some(o => o.id === v)) return v;
+    } catch {}
+    return DEFAULT_MODEL_ID;
+  };
+
+  const [model, setModel] = useState<string>(getStoredModel());
+  const [isModelMenuOpen, setIsModelMenuOpen] = useState(false);
+  const [modelMenuActiveIdx, setModelMenuActiveIdx] = useState(() => {
+    const idx = MODEL_OPTIONS.findIndex(o => o.id === getStoredModel());
+    return idx >= 0 ? idx : 0;
+  });
+  const modelMenuRef = useRef<HTMLDivElement>(null);
+
+  const selectedModelLabel = useMemo(() => {
+    return MODEL_OPTIONS.find(o => o.id === model)?.label || model;
+  }, [MODEL_OPTIONS, model]);
+
+  const selectModel = useCallback((next: string) => {
+    if (!MODEL_OPTIONS.some(o => o.id === next)) return;
+    setModel(next);
+    try { localStorage.setItem('screenwriter_ai_model', next); } catch {}
+  }, [MODEL_OPTIONS]);
+
+  useEffect(() => {
+    if (!isModelMenuOpen) return;
+    const onDown = (e: MouseEvent) => {
+      const target = e.target as Node | null;
+      if (!target) return;
+      if (modelMenuRef.current && !modelMenuRef.current.contains(target)) {
+        setIsModelMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [isModelMenuOpen]);
 
   // Resize state
   const [isDragging, setIsDragging] = useState(false);
@@ -326,7 +376,39 @@ export default function AIChat({
         const why = (evt as any).why ? ` — ${(evt as any).why}` : '';
         lines.push(`[Decision] ${(evt as any).action}${why}`);
       } else if (evt.type === 'tool_call' && (evt as any).tool) {
-        lines.push(`[Tool] ${(evt as any).tool}`);
+        const tool = String((evt as any).tool);
+        const labels: Record<string, string> = {
+          update_plan: 'Updating plan',
+          web_search: 'Searching the web',
+          code_interpreter: 'Running Python analysis',
+          search_screenplay: 'Searching screenplay',
+          list_scenes: 'Listing scenes',
+          find_character_scenes: 'Finding character scenes',
+          load_elements: 'Loading elements',
+          submit_edits: 'Submitting edits',
+          verify_edits: 'Verifying edits',
+          manage_beats: 'Updating beats',
+          count_elements: 'Counting elements',
+        };
+        let label = labels[tool] || tool;
+        const payload = (evt as any).payload;
+        if (payload && typeof payload === 'string') {
+          try {
+            const args = JSON.parse(payload);
+            if (tool === 'search_screenplay' && Array.isArray(args.search_terms) && args.search_terms.length) {
+              label = `Searching: ${args.search_terms.slice(0, 4).join(', ')}`;
+            } else if (tool === 'list_scenes' && Array.isArray(args.search_terms) && args.search_terms.length) {
+              label = `Listing scenes: ${args.search_terms.slice(0, 4).join(', ')}`;
+            } else if (tool === 'find_character_scenes' && Array.isArray(args.character_terms) && args.character_terms.length) {
+              label = `Character scenes: ${args.character_terms.slice(0, 4).join(', ')}`;
+            } else if (tool === 'load_elements' && Array.isArray(args.element_ids)) {
+              label = `Loading ${args.element_ids.length} element(s)`;
+            }
+          } catch {
+            // ignore malformed tool args
+          }
+        }
+        lines.push(`[Tool] ${label}`);
       } else if (evt.type === 'tool_result' && (evt as any).tool) {
         const count = (evt as any).count;
         lines.push(`[Tool] ${(evt as any).tool}${typeof count === 'number' ? ` (${count})` : ''}`);
@@ -347,10 +429,20 @@ export default function AIChat({
     return deduped.slice(-1);
   };
 
-  type TodoView = { id: string; label: string; status: string };
+  type TodoView = { id: string; label: string; status: string; rationale?: string };
 
-  const extractTodosFromEvents = (events?: AIStreamEvent[]): TodoView[] => {
-    if (!events || events.length === 0) return [];
+  const extractPlanFromEvents = (events?: AIStreamEvent[]): PlanState | null => {
+    if (!events || events.length === 0) return null;
+
+    // Prefer the latest structured plan_updated event.
+    for (let i = events.length - 1; i >= 0; i--) {
+      const evt: any = events[i];
+      if (evt && evt.type === 'plan_updated' && evt.plan && typeof evt.plan === 'object') {
+        return evt.plan as PlanState;
+      }
+    }
+
+    // Legacy fallback: plan_todos + todo_update patches.
     let planIdx = -1;
     for (let i = events.length - 1; i >= 0; i--) {
       const evt: any = events[i];
@@ -359,19 +451,19 @@ export default function AIChat({
         break;
       }
     }
-    if (planIdx === -1) return [];
+    if (planIdx === -1) return null;
 
     const planEvt: any = events[planIdx] as any;
     const initialTodos: TodoView[] = (planEvt.todos as any[])
       .filter(t => t && typeof t === 'object')
       .map(t => ({
         id: String((t as any).id || '').trim(),
-        label: String((t as any).label || '').trim(),
+        label: String((t as any).label || (t as any).title || '').trim(),
         status: String((t as any).status || 'pending').trim(),
       }))
       .filter(t => t.id && t.label);
 
-    if (initialTodos.length === 0) return [];
+    if (initialTodos.length === 0) return null;
 
     const byId = new Map<string, TodoView>();
     initialTodos.forEach(t => byId.set(t.id, t));
@@ -390,25 +482,42 @@ export default function AIChat({
       }
     }
 
-    return initialTodos;
+    return {
+      summary: '',
+      todos: initialTodos.map(t => ({
+        id: t.id,
+        title: t.label,
+        status: t.status as TodoItem['status'],
+      })),
+    };
   };
 
-  const extractPlanIntentFromEvents = (events?: AIStreamEvent[]): string => {
-    if (!events || events.length === 0) return '';
-    // Find the latest plan_intent tool result
-    for (let i = events.length - 1; i >= 0; i--) {
-      const evt: any = events[i];
-      if (!evt || typeof evt !== 'object') continue;
-      if (evt.type === 'tool_result' && evt.tool === 'llm.plan_intent') {
-        const plan = evt.plan;
-        const intent =
-          (plan && typeof plan === 'object' && typeof plan.intent === 'string' && plan.intent.trim())
-            ? plan.intent.trim()
-            : (typeof evt.intent_preview === 'string' ? evt.intent_preview.trim() : '');
-        return intent || '';
-      }
-    }
-    return '';
+  const extractTodosFromEvents = (events?: AIStreamEvent[]): TodoView[] => {
+    const plan = extractPlanFromEvents(events);
+    if (!plan || !plan.todos?.length) return [];
+    return plan.todos.map(t => ({
+      id: t.id,
+      label: t.title,
+      status: t.status,
+      rationale: t.rationale,
+    }));
+  };
+
+  const planHasFinalEvent = (events?: AIStreamEvent[]): boolean => {
+    return Boolean(events?.some(evt => evt && evt.type === 'final'));
+  };
+
+  const normalizeTodosForDisplay = (todos: TodoView[], allowActiveSpinner: boolean): TodoView[] => {
+    if (allowActiveSpinner) return todos;
+
+    return todos.map(todo => {
+      if (todo.status !== 'in_progress') return todo;
+      return {
+        ...todo,
+        status: 'paused',
+        rationale: todo.rationale || 'This step was still active when the response finished.',
+      };
+    });
   };
 
   const getApplyingElementIds = (events?: AIStreamEvent[]): string[] => {
@@ -460,10 +569,10 @@ export default function AIChat({
 
   const stripProgressMarkers = (content: string): string => {
     if (!content) return '';
-    // Remove bracketed progress segments from the text body.
-    // This is intentionally conservative (only removes "[...]" segments and trailing text up to EOL).
+    // Remove bracketed progress segments (e.g. "[Searching] Querying…") from the text body.
+    // (?!\() skips markdown links like [Smithsonian](https://…) used in web-search citations.
     return content
-      .replace(/\s*\[[^\]]+\][^\n]*\n?/g, '\n')
+      .replace(/\s*\[[^\]]+\](?!\()[^\n]*\n?/g, '\n')
       .replace(/\n{3,}/g, '\n\n')
       .trim();
   };
@@ -721,6 +830,7 @@ export default function AIChat({
       selectedText: bundle.selectedText,
       contextPolicy: 'scene_plus_adjacent',
       contextElementIds: bundle.contextElementIds,
+      model,
     });
     setInput('');
   };
@@ -734,6 +844,7 @@ export default function AIChat({
       selectedText: bundle.selectedText,
       contextPolicy: 'scene_plus_adjacent',
       contextElementIds: bundle.contextElementIds,
+      model,
     });
   };
 
@@ -782,6 +893,94 @@ export default function AIChat({
           </button>
         </div>
         <div className="ai-header-actions">
+          <div className="ai-header-model" ref={modelMenuRef}>
+            <button
+              type="button"
+              className="ai-model-trigger"
+              disabled={isStreaming}
+              aria-haspopup="listbox"
+              aria-expanded={isModelMenuOpen}
+              title="AI model"
+              onClick={() => {
+                if (isStreaming) return;
+                setIsModelMenuOpen(v => !v);
+                const idx = MODEL_OPTIONS.findIndex(o => o.id === model);
+                setModelMenuActiveIdx(idx >= 0 ? idx : 0);
+              }}
+              onKeyDown={(e) => {
+                if (isStreaming) return;
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  setIsModelMenuOpen(true);
+                  const idx = MODEL_OPTIONS.findIndex(o => o.id === model);
+                  setModelMenuActiveIdx(idx >= 0 ? idx : 0);
+                } else if (e.key === 'ArrowDown') {
+                  e.preventDefault();
+                  setIsModelMenuOpen(true);
+                  setModelMenuActiveIdx(prev => Math.min(MODEL_OPTIONS.length - 1, prev + 1));
+                } else if (e.key === 'ArrowUp') {
+                  e.preventDefault();
+                  setIsModelMenuOpen(true);
+                  setModelMenuActiveIdx(prev => Math.max(0, prev - 1));
+                } else if (e.key === 'Escape') {
+                  setIsModelMenuOpen(false);
+                }
+              }}
+            >
+              <span className="ai-model-trigger-label">{selectedModelLabel}</span>
+              <ChevronDown size={14} />
+            </button>
+
+            {isModelMenuOpen && (
+              <div
+                className="ai-model-menu"
+                role="listbox"
+                aria-label="AI model"
+                tabIndex={-1}
+                onKeyDown={(e) => {
+                  if (e.key === 'Escape') {
+                    e.preventDefault();
+                    setIsModelMenuOpen(false);
+                  } else if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    setModelMenuActiveIdx(prev => Math.min(MODEL_OPTIONS.length - 1, prev + 1));
+                  } else if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    setModelMenuActiveIdx(prev => Math.max(0, prev - 1));
+                  } else if (e.key === 'Enter') {
+                    e.preventDefault();
+                    const opt = MODEL_OPTIONS[modelMenuActiveIdx];
+                    if (opt) {
+                      selectModel(opt.id);
+                      setIsModelMenuOpen(false);
+                    }
+                  }
+                }}
+              >
+                {MODEL_OPTIONS.map((opt, idx) => {
+                  const isSelected = opt.id === model;
+                  const isActive = idx === modelMenuActiveIdx;
+                  return (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      role="option"
+                      aria-selected={isSelected}
+                      className={`ai-model-option ${isSelected ? 'selected' : ''} ${isActive ? 'active' : ''}`}
+                      onMouseEnter={() => setModelMenuActiveIdx(idx)}
+                      onClick={() => {
+                        selectModel(opt.id);
+                        setIsModelMenuOpen(false);
+                      }}
+                    >
+                      <span>{opt.label}</span>
+                      {isSelected && <Check size={14} />}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
           {messages.length > 0 && (
             <button
               className="ai-header-btn-minimal"
@@ -839,12 +1038,27 @@ export default function AIChat({
             if (fromEvents.length > 0) return fromEvents;
             return progressSource ? extractProgressSteps(progressSource) : [];
           })();
-          const todoItems = (() => {
+          const rawTodoItems = (() => {
             if (!(mode === 'edit' || mode === 'ask')) return [];
             return extractTodosFromEvents(msg.events);
           })();
-          const planIntentText = mode === 'edit' ? extractPlanIntentFromEvents(msg.events) : '';
-          const planIntentDisplay = planIntentText ? `Plan: ${planIntentText}` : '';
+          const activePlan = (() => {
+            if (!(mode === 'edit' || mode === 'ask')) return null;
+            return extractPlanFromEvents(msg.events);
+          })();
+          const hasFinalPlanEvent = planHasFinalEvent(msg.events);
+          const allowActivePlanSpinner =
+            msg.role === 'assistant' &&
+            isLastMessage &&
+            (isStreamingEdit || isStreamingAsk) &&
+            !hasFinalPlanEvent;
+          const todoItems = normalizeTodosForDisplay(rawTodoItems, allowActivePlanSpinner);
+          const planSummaryDisplay = activePlan?.summary?.trim() || '';
+          const planHasOpenTodos = todoItems.some(
+            t => t.status === 'pending' || t.status === 'in_progress' || t.status === 'blocked' || t.status === 'paused'
+          );
+          const planIsActivelyRunning = todoItems.some(t => t.status === 'in_progress');
+          const planHasBlockedTodos = todoItems.some(t => t.status === 'blocked');
           const applyingElementIds = isStreamingEdit ? getApplyingElementIds(msg.events) : [];
           
           // Get all elements being edited - from completed edits or detected during streaming
@@ -892,10 +1106,15 @@ export default function AIChat({
           if (hasEdits && msg.edits && msg.edits.length > 0) {
             // Prefer per-element reasons rendered below each edit card (Cursor-like).
             displayContent = '';
-          } else if (isStreamingEdit || isStreamingAsk) {
-            // While streaming (edit/ask), prefer the progress stack (Cursor-like)
-            // and avoid duplicating verbose intermediate text in the body.
+          } else if (isStreamingEdit) {
+            // While streaming edits, prefer the progress stack and avoid
+            // duplicating verbose intermediate text in the body.
             displayContent = '';
+          } else if (isStreamingAsk) {
+            // While streaming ask responses, show real-time text deltas.
+            // This enables visible "thinking/planning/answer" text progression.
+            const stripped = stripJSONFromContent(msg.content || '');
+            displayContent = stripped;
           } else if (msg.content) {
             // In edit mode during streaming, completely hide content if it contains JSON
             if (isStreamingEdit && containsJSON(msg.content)) {
@@ -914,35 +1133,51 @@ export default function AIChat({
                 {msg.role === 'user' ? <User size={14} /> : <Bot size={14} />}
               </div>
               <div className="ai-message-bubble">
-                {/* Plan intent (edit loop): show as assistant text above todos/progress */}
-                {msg.role === 'assistant' && mode === 'edit' && planIntentDisplay && (
+                {/* Plan summary */}
+                {msg.role === 'assistant' && planSummaryDisplay && (
                   <div
-                    className="ai-message-content ai-plan-intent"
-                    dangerouslySetInnerHTML={{ __html: marked.parse(planIntentDisplay) as string }}
+                    className="ai-edit-item-reason ai-plan-intent"
+                    dangerouslySetInnerHTML={{ __html: marked.parse(planSummaryDisplay) as string }}
                   />
                 )}
 
-                {/* Todos checklist (Cursor-like) */}
-                {(isStreamingEdit || isStreamingAsk) && todoItems.length > 0 && (
+                {/* Todos checklist (Cursor-like) — persist after streaming so incomplete plans stay visible */}
+                {msg.role === 'assistant' && todoItems.length > 0 && (
                   <div className="ai-todos">
+                    {planHasOpenTodos && !planIsActivelyRunning && (
+                      <div className="ai-plan-meta">
+                        <span className="ai-plan-meta-label">Plan paused</span>
+                        <span className="ai-plan-meta-item">
+                          {planHasBlockedTodos
+                            ? 'Reply below to continue — blocked steps need your input.'
+                            : 'The response ended before every plan step reported a final status.'}
+                        </span>
+                      </div>
+                    )}
                     {todoItems.map((t) => {
                       const status = t.status;
                       const isDone = status === 'done';
                       const isActive = status === 'in_progress';
-                      const isSkipped = status === 'skipped';
+                      const isSkipped = status === 'skipped' || status === 'cancelled';
+                      const isBlocked = status === 'blocked';
+                      const isPaused = status === 'paused';
                       return (
                         <div
                           key={t.id}
                           className={`ai-todo ai-todo--${status}`}
-                          title={status}
+                          title={t.rationale || status}
                         >
                           <span className="ai-todo-icon">
                             {isDone ? (
                               <Check size={14} />
                             ) : isActive ? (
                               <Loader2 size={14} className="ai-todo-spinner" />
+                            ) : isBlocked ? (
+                              <span className="ai-todo-blocked">!</span>
                             ) : isSkipped ? (
                               <span className="ai-todo-skip">–</span>
+                            ) : isPaused ? (
+                              <span className="ai-todo-pause">–</span>
                             ) : (
                               <span className="ai-todo-dot" />
                             )}
@@ -951,11 +1186,27 @@ export default function AIChat({
                         </div>
                       );
                     })}
+                    {activePlan?.known_facts && activePlan.known_facts.length > 0 && (
+                      <div className="ai-plan-meta">
+                        <span className="ai-plan-meta-label">Known</span>
+                        {activePlan.known_facts.slice(0, 3).map((fact, idx) => (
+                          <span key={idx} className="ai-plan-meta-item">{fact}</span>
+                        ))}
+                      </div>
+                    )}
+                    {activePlan?.risks && activePlan.risks.length > 0 && (
+                      <div className="ai-plan-meta ai-plan-meta--risk">
+                        <span className="ai-plan-meta-label">Risks</span>
+                        {activePlan.risks.slice(0, 3).map((risk, idx) => (
+                          <span key={idx} className="ai-plan-meta-item">{risk}</span>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 )}
 
                 {/* Progress timeline (Cursor-like): show only the current step (latest) */}
-                {(isStreamingEdit || isStreamingAsk) && progressSteps.length > 0 && (
+                {(isStreamingEdit || (isStreamingAsk && !displayContent)) && progressSteps.length > 0 && (
                   <div className="ai-progress">
                     <div className="ai-progress-line ai-progress-line--active">
                       {progressSteps[progressSteps.length - 1]}
@@ -1003,11 +1254,92 @@ export default function AIChat({
                 {/* Display content - reasons or cleaned content */}
                 {displayContent && (
                   <div
-                    className="ai-message-content"
+                    className={`ai-message-content ${isStreamingAsk ? 'ai-message-content--thinking' : ''}`}
                     dangerouslySetInnerHTML={{
                       __html: marked.parse(displayContent) as string
                     }}
                   ></div>
+                )}
+
+                {msg.role === 'assistant' &&
+                  msg.beatOps &&
+                  msg.beatOps.length > 0 &&
+                  !dismissedBeatOpMessages.has(i) && (
+                  <div className="beat-ai-suggestion">
+                    <div className="beat-ai-suggestion-header">Proposed beat changes</div>
+                    <div className="beat-ai-suggestion-desc">
+                      {msg.beatOps.slice(0, 20).map((op, opIdx) => {
+                        let title = '';
+                        let description = '';
+                        let actionLabel = '';
+
+                        if (op.op === 'create') {
+                          title = (op.beat?.title || '').trim() || 'Untitled beat';
+                          description = (op.beat?.description || '').trim();
+                          actionLabel = `Create in Act ${op.actIndex + 1}${
+                            op.insertAfterOrder !== undefined ? ` after #${op.insertAfterOrder + 1}` : ''
+                          }`;
+                        } else if (op.op === 'update') {
+                          const beat = (beats || []).find(b => b.id === op.id);
+                          title = (op.updates?.title || beat?.title || '').trim() || op.id;
+                          description = (op.updates?.description || beat?.description || '').trim();
+                          const fields = Object.keys(op.updates || {}).join(', ') || 'fields';
+                          actionLabel = `Update: ${fields}`;
+                        } else if (op.op === 'move') {
+                          const beat = (beats || []).find(b => b.id === op.id);
+                          title = beat?.title || op.id;
+                          description = beat?.description || '';
+                          actionLabel = `Move to Act ${op.targetActIndex + 1}, position ${op.targetOrder + 1}`;
+                        } else if (op.op === 'delete') {
+                          const beat = (beats || []).find(b => b.id === op.id);
+                          title = beat?.title || op.id;
+                          description = beat?.description || '';
+                          actionLabel = 'Delete';
+                        }
+
+                        return (
+                          <div
+                            key={opIdx}
+                            style={{ marginTop: 12, padding: 12, background: 'var(--bg-secondary)', borderRadius: 6 }}
+                          >
+                            <div style={{ fontSize: '0.875rem', fontWeight: 500, color: 'var(--text-primary)', marginBottom: 4 }}>
+                              {actionLabel}
+                            </div>
+                            <div style={{ fontSize: '0.9375rem', fontWeight: 600, color: 'var(--text-primary)', marginBottom: description ? 4 : 0 }}>
+                              {title}
+                            </div>
+                            {description && (
+                              <div style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)', marginTop: 4, lineHeight: 1.4 }}>
+                                {description}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                      {msg.beatOps.length > 20 && (
+                        <div style={{ marginTop: 8, opacity: 0.8 }}>… more ops not shown</div>
+                      )}
+                    </div>
+                    <div className="beat-ai-suggestion-actions">
+                      <button
+                        className="beat-ai-primary"
+                        onClick={() => {
+                          onApplyBeatOps?.(msg.beatOps!);
+                          setDismissedBeatOpMessages(prev => new Set(prev).add(i));
+                        }}
+                        disabled={!onApplyBeatOps}
+                        title="Apply all proposed beat changes"
+                      >
+                        Apply all to beat board
+                      </button>
+                      <button
+                        className="beat-ai-secondary"
+                        onClick={() => setDismissedBeatOpMessages(prev => new Set(prev).add(i))}
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                  </div>
                 )}
 
                 {/* Show typing indicator if streaming and no content yet */}
@@ -1128,9 +1460,6 @@ export default function AIChat({
               <Send size={16} />
             </button>
           )}
-        </div>
-        <div className="ai-input-hint">
-          <kbd>↵</kbd> to send · <kbd>Esc</kbd> to close
         </div>
       </div>
     </div>
