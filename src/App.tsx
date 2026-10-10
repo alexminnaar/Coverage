@@ -1,9 +1,14 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { lazy, Suspense, useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { v4 as uuidv4 } from 'uuid';
-import { Screenplay, ScriptElement, ElementType, getDefaultNextType, ProjectMeta, Theme, Beat, BeatStructure, BEAT_STRUCTURES, Revision, PendingEdit } from './types';
+import { Screenplay, ScriptElement, ElementType, getDefaultNextType, ProjectMeta, Theme, Beat, BeatStructure, BEAT_STRUCTURES, Revision, PendingEdit, ELEMENT_LABELS, SceneStoryboard as SceneStoryboardData } from './types';
 import { applyBeatOps } from './utils/applyBeatOps';
+import { applyStoryboardOps } from './utils/applyStoryboardOps';
+import type { StoryboardOp } from './utils/applyStoryboardOps';
+import { generateStoryboardImage } from './services/aiClient';
+import type { AIChatMode } from './services/aiClient';
 import {
-  loadCurrentScreenplay,
+  loadCurrentScreenplayAsync,
+  createDefaultScreenplay,
   saveProject,
   debounce,
   createNewProjectAsync,
@@ -18,7 +23,7 @@ import {
   renameSnapshot,
 } from './storage';
 import { initAPIMode } from './services/apiClient';
-import { exportToPDF, estimatePageCount } from './pdfExport';
+import { estimatePageCount } from './utils/pageEstimate';
 import { useHistory } from './hooks/useHistory';
 import { parseFountainFile, extractTitlePage } from './utils/fountainParser';
 import { downloadFountain } from './utils/fountainExporter';
@@ -27,22 +32,11 @@ import { startDualDialogue } from './utils/dualDialogue';
 import Header from './components/Header';
 import SceneNavigator from './components/SceneNavigator';
 import ScriptEditor from './components/ScriptEditor';
+import EditReviewBar from './components/EditReviewBar';
 import KeyboardHelp from './components/KeyboardHelp';
 import FindReplace from './components/FindReplace';
 import ProjectList from './components/ProjectList';
-import TitlePageEditor from './components/TitlePageEditor';
-import Statistics from './components/Statistics';
-import BeatBoard from './components/BeatBoard';
-import AIChat from './components/AIChat';
-import AICommandPalette from './components/AICommandPalette';
-import AISettings from './components/AISettings';
-import SnapshotsPanel from './components/SnapshotsPanel';
-import RevisionManager from './components/RevisionManager';
-import PrintPreview from './components/PrintPreview';
 import NotesPanel from './components/NotesPanel';
-import WritingGoals from './components/WritingGoals';
-import CharacterTracker from './components/CharacterTracker';
-import SceneCompare from './components/SceneCompare';
 import { downloadFdx } from './utils/fdxExporter';
 import { ScriptNote, WritingGoal, WritingSession } from './types';
 import {
@@ -52,6 +46,38 @@ import {
   updateTodaySession,
 } from './storage';
 import { calculateStreak, calculateLongestStreak, countWords, estimatePages } from './utils/writingStats';
+import { applyPendingEdit } from './utils/applyPendingEdit';
+import { reconcilePendingEdits } from './utils/reconcilePendingEdits';
+
+const TitlePageEditor = lazy(() => import('./components/TitlePageEditor'));
+const Statistics = lazy(() => import('./components/Statistics'));
+const BeatBoard = lazy(() => import('./components/BeatBoard'));
+const SceneStoryboard = lazy(() => import('./components/SceneStoryboard'));
+const AIChat = lazy(() => import('./components/AIChat'));
+const AICommandPalette = lazy(() => import('./components/AICommandPalette'));
+const AISettings = lazy(() => import('./components/AISettings'));
+const SnapshotsPanel = lazy(() => import('./components/SnapshotsPanel'));
+const RevisionManager = lazy(() => import('./components/RevisionManager'));
+const PrintPreview = lazy(() => import('./components/PrintPreview'));
+const WritingGoals = lazy(() => import('./components/WritingGoals'));
+const CharacterTracker = lazy(() => import('./components/CharacterTracker'));
+const SceneCompare = lazy(() => import('./components/SceneCompare'));
+
+function ToolLoadingFallback() {
+  return (
+    <div className="tool-loading-fallback" role="status" aria-live="polite">
+      Loading tool…
+    </div>
+  );
+}
+
+function RightPanelLoadingFallback() {
+  return (
+    <aside className="right-panel-loading" role="status" aria-live="polite">
+      Loading AI…
+    </aside>
+  );
+}
 
 // AI enabled storage
 function getStoredAIEnabled(): boolean {
@@ -75,6 +101,8 @@ function getEffectiveTheme(theme: Theme): 'dark' | 'light' {
   return theme;
 }
 
+type SaveStatus = 'saving' | 'saved' | 'error';
+
 function App() {
   // Use history hook for undo/redo
   const {
@@ -84,8 +112,8 @@ function App() {
     redo,
     canUndo,
     canRedo,
-    clearHistory
-  } = useHistory<Screenplay>(() => loadCurrentScreenplay(), { maxHistory: 50 });
+    resetState,
+  } = useHistory<Screenplay>(() => createDefaultScreenplay(), { maxHistory: 50 });
 
   const [focusedElementId, setFocusedElementId] = useState<string | null>(null);
   const [activeElementId, setActiveElementId] = useState<string | null>(null); // Currently active/focused element in editor
@@ -96,6 +124,12 @@ function App() {
   const [showStatistics, setShowStatistics] = useState(false);
   const [showBeatBoard, setShowBeatBoard] = useState(false);
   const [beatBoardSelectedBeatId, setBeatBoardSelectedBeatId] = useState<string | null>(null);
+  const [beatBoardView, setBeatBoardView] = useState<'board' | 'treatment'>('board');
+  const [showStoryboard, setShowStoryboard] = useState(false);
+  const [storyboardSceneId, setStoryboardSceneId] = useState<string | null>(null);
+  const screenplayWorkspaceRef = useRef<HTMLDivElement>(null);
+  const beatBoardReturnFocusRef = useRef<HTMLElement | null>(null);
+  const beatBoardWasOpenRef = useRef(false);
   const [showSnapshots, setShowSnapshots] = useState(false);
   const [showRevisions, setShowRevisions] = useState(false);
   const [showPrintPreview, setShowPrintPreview] = useState(false);
@@ -128,29 +162,77 @@ function App() {
   // AI features state
   const [aiEnabled, setAIEnabled] = useState(() => getStoredAIEnabled());
   const [showAIChat, setShowAIChat] = useState(false);
+  const [hasOpenedAIChat, setHasOpenedAIChat] = useState(false);
   const [showAICommand, setShowAICommand] = useState(false);
   const [showAISettings, setShowAISettings] = useState(false);
   const [aiPanelWidth, setAIPanelWidth] = useState(400);
+  const [requestedAIChatMode, setRequestedAIChatMode] = useState<AIChatMode | undefined>();
+  const [requestedAIChatPrompt, setRequestedAIChatPrompt] = useState<{ id: string; content: string }>();
 
   // Pending AI edits (Cursor-style inline edits)
   const [pendingEdits, setPendingEdits] = useState<Map<string, PendingEdit>>(new Map());
+  const [reviewElementId, setReviewElementId] = useState<string | null>(null);
 
-  // Track if we're saving to avoid undo issues
-  const isSavingRef = useRef(false);
+  const [saveStatus, setSaveStatus] = useState<SaveStatus>('saved');
+  const [isHydrated, setIsHydrated] = useState(false);
+  const saveVersionRef = useRef(0);
+  const screenplayElementsRef = useRef(screenplay.elements);
+  screenplayElementsRef.current = screenplay.elements;
 
-  // Initialize API mode and load projects on mount
   useEffect(() => {
+    setPendingEdits(new Map());
+    setReviewElementId(null);
+  }, [screenplay.id]);
+
+  useEffect(() => {
+    const workspace = screenplayWorkspaceRef.current;
+    if (!workspace) return;
+    const overlayOpen = showBeatBoard || showStoryboard;
+    if (overlayOpen) {
+      workspace.setAttribute('inert', '');
+    } else {
+      workspace.removeAttribute('inert');
+    }
+
+    if (overlayOpen && !beatBoardWasOpenRef.current) {
+      beatBoardReturnFocusRef.current = document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+      requestAnimationFrame(() => {
+        document.querySelector<HTMLElement>('.beat-board, .scene-storyboard')?.focus();
+      });
+    } else if (!overlayOpen && beatBoardWasOpenRef.current) {
+      requestAnimationFrame(() => beatBoardReturnFocusRef.current?.focus());
+    }
+    beatBoardWasOpenRef.current = overlayOpen;
+  }, [showBeatBoard, showStoryboard]);
+
+  // Resolve the database-backed active project before enabling autosave. This
+  // prevents a stale synchronous local copy from overwriting newer remote work.
+  useEffect(() => {
+    let cancelled = false;
     initAPIMode();
-    const loadProjects = async () => {
+
+    const hydrate = async () => {
       try {
+        const loadedScreenplay = await loadCurrentScreenplayAsync();
         const loadedProjects = await loadProjectsList();
+        if (cancelled) return;
+        resetState(loadedScreenplay);
         setProjects(loadedProjects);
+        setSaveStatus('saved');
       } catch (error) {
-        console.error('Failed to load projects:', error);
+        console.error('Failed to hydrate screenplay:', error);
+      } finally {
+        if (!cancelled) setIsHydrated(true);
       }
     };
-    loadProjects();
-  }, []);
+
+    hydrate();
+    return () => {
+      cancelled = true;
+    };
+  }, [resetState]);
 
   // Apply theme to document
   useEffect(() => {
@@ -177,16 +259,21 @@ function App() {
   // Debounced save function
   const debouncedSave = useMemo(
     () => debounce(async (sp: Screenplay) => {
-      isSavingRef.current = true;
+      const saveVersion = ++saveVersionRef.current;
+      setSaveStatus('saving');
       try {
         await saveProject(sp);
         // Refresh projects list
         const updatedProjects = await loadProjectsList();
         setProjects(updatedProjects);
+        if (saveVersion === saveVersionRef.current) {
+          setSaveStatus('saved');
+        }
       } catch (error) {
         console.error('Failed to save project:', error);
-      } finally {
-        isSavingRef.current = false;
+        if (saveVersion === saveVersionRef.current) {
+          setSaveStatus('error');
+        }
       }
     }, 500),
     []
@@ -194,8 +281,9 @@ function App() {
 
   // Auto-save when screenplay changes
   useEffect(() => {
+    if (!isHydrated) return;
     debouncedSave(screenplay);
-  }, [screenplay, debouncedSave]);
+  }, [screenplay, debouncedSave, isHydrated]);
 
   // Update title
   const handleTitleChange = useCallback((title: string) => {
@@ -279,12 +367,19 @@ function App() {
       }
 
       const idx = prev.elements.findIndex(el => el.id === id);
+      const deletedElement = prev.elements[idx];
       const newElements = prev.elements.filter(el => el.id !== id);
 
       // Focus the previous element, or the next if deleting the first
       const focusIdx = Math.max(0, idx - 1);
       if (newElements[focusIdx]) {
         setFocusedElementId(newElements[focusIdx].id);
+      }
+
+      if (deletedElement?.type === 'scene-heading' && prev.storyboards?.[id]) {
+        const storyboards = { ...prev.storyboards };
+        delete storyboards[id];
+        return { ...prev, elements: newElements, storyboards };
       }
 
       return { ...prev, elements: newElements };
@@ -308,7 +403,8 @@ function App() {
   }, []);
 
   // Export to PDF
-  const handleExportPDF = useCallback(() => {
+  const handleExportPDF = useCallback(async () => {
+    const { exportToPDF } = await import('./pdfExport');
     exportToPDF(screenplay);
   }, [screenplay]);
 
@@ -321,15 +417,14 @@ function App() {
   const handleNew = useCallback(async () => {
     try {
       const newProject = await createNewProjectAsync();
-      setScreenplay(newProject);
-      clearHistory();
+      resetState(newProject);
       const updatedProjects = await loadProjectsList();
       setProjects(updatedProjects);
       setShowProjectList(false);
     } catch (error) {
       console.error('Failed to create new project:', error);
     }
-  }, [setScreenplay, clearHistory]);
+  }, [resetState]);
 
   // Switch to a different project
   const handleSwitchProject = useCallback(async (id: string) => {
@@ -337,14 +432,13 @@ function App() {
       const project = await loadProject(id);
       if (project) {
         setCurrentProjectId(id);
-        setScreenplay(project);
-        clearHistory();
+        resetState(project);
         setShowProjectList(false);
       }
     } catch (error) {
       console.error('Failed to load project:', error);
     }
-  }, [setScreenplay, clearHistory]);
+  }, [resetState]);
 
   // Delete a project
   const handleDeleteProject = useCallback(async (id: string) => {
@@ -392,15 +486,14 @@ function App() {
 
       await saveProject(imported);
       setCurrentProjectId(imported.id);
-      setScreenplay(imported);
-      clearHistory();
+      resetState(imported);
       const updatedProjects = await loadProjectsList();
       setProjects(updatedProjects);
     } catch (e) {
       console.error('Failed to import file:', e);
       alert('Failed to import file. Please check the format.');
     }
-  }, [setScreenplay, clearHistory]);
+  }, [resetState]);
 
   // Find and replace
   const handleReplaceAll = useCallback((find: string, replace: string, caseSensitive: boolean) => {
@@ -449,20 +542,152 @@ function App() {
     setScreenplay(prev => ({ ...prev, beats }));
   }, [setScreenplay]);
 
+  const handleTreatmentChange = useCallback((treatment: string) => {
+    setScreenplay(prev => ({ ...prev, treatment }));
+  }, [setScreenplay]);
+
   const handleApplyBeatOps = useCallback((ops: Parameters<typeof applyBeatOps>[1]) => {
+    const treatmentOp = [...ops]
+      .reverse()
+      .find((op) => op.op === 'set_treatment');
     setScreenplay(prev => {
       const structure = prev.beatStructure || 'three-act';
       const actCount = (BEAT_STRUCTURES[structure] ?? BEAT_STRUCTURES['three-act']).length;
       return {
         ...prev,
         beats: applyBeatOps(prev.beats || [], ops, actCount),
+        treatment: treatmentOp?.op === 'set_treatment'
+          ? treatmentOp.treatment
+          : prev.treatment,
       };
     });
+    setBeatBoardView(treatmentOp ? 'treatment' : 'board');
+    setShowBeatBoard(true);
   }, [setScreenplay]);
 
   const handleBeatStructureChange = useCallback((beatStructure: BeatStructure) => {
     setScreenplay(prev => ({ ...prev, beatStructure }));
   }, [setScreenplay]);
+
+  const handleStoryboardsChange = useCallback((storyboards: Record<string, SceneStoryboardData>) => {
+    setScreenplay(prev => ({ ...prev, storyboards }));
+  }, [setScreenplay]);
+
+  const handleApplyStoryboardOps = useCallback((ops: StoryboardOp[]) => {
+    setScreenplay(prev => ({
+      ...prev,
+      storyboards: applyStoryboardOps(prev.storyboards || {}, ops),
+    }));
+    const proposedSceneId = ops.find(op => op.sceneId)?.sceneId;
+    if (proposedSceneId) setStoryboardSceneId(proposedSceneId);
+    setShowBeatBoard(false);
+    setShowStoryboard(true);
+  }, [setScreenplay]);
+
+  const handleGenerateStoryboardShot = useCallback(async (sceneId: string, shotId: string) => {
+    const storyboard = screenplay.storyboards?.[sceneId];
+    const shot = storyboard?.shots.find(item => item.id === shotId);
+    if (!storyboard || !shot) {
+      throw new Error('This storyboard shot no longer exists.');
+    }
+
+    setScreenplay(prev => {
+      const current = prev.storyboards?.[sceneId];
+      if (!current) return prev;
+      return {
+        ...prev,
+        storyboards: {
+          ...prev.storyboards,
+          [sceneId]: {
+            ...current,
+            shots: current.shots.map(item => item.id === shotId
+              ? {
+                  ...item,
+                  image: {
+                    ...item.image,
+                    status: 'generating',
+                    error: undefined,
+                  },
+                }
+              : item),
+            updatedAt: Date.now(),
+          },
+        },
+      };
+    });
+
+    const prompt = [
+      shot.imagePrompt || shot.action,
+      `Shot: ${shot.shotType}${shot.cameraAngle ? `, ${shot.cameraAngle}` : ''}.`,
+      shot.characters.length ? `Characters: ${shot.characters.join(', ')}.` : '',
+      shot.dialogue ? `Moment of dialogue: ${shot.dialogue}` : '',
+      shot.continuityNotes ? `Continuity: ${shot.continuityNotes}` : '',
+    ].filter(Boolean).join('\n');
+
+    try {
+      const generated = await generateStoryboardImage({
+        projectId: screenplay.id,
+        sceneId,
+        shotId,
+        prompt,
+        style: storyboard.style,
+        aspectRatio: storyboard.aspectRatio,
+        previousProviderAssetId: shot.image?.providerAssetId,
+      });
+      setScreenplay(prev => {
+        const current = prev.storyboards?.[sceneId];
+        if (!current) return prev;
+        return {
+          ...prev,
+          storyboards: {
+            ...prev.storyboards,
+            [sceneId]: {
+              ...current,
+              shots: current.shots.map(item => item.id === shotId
+                ? {
+                    ...item,
+                    image: {
+                      status: 'complete',
+                      url: generated.url,
+                      providerAssetId: generated.providerAssetId,
+                      createdAt: Date.now(),
+                    },
+                  }
+                : item),
+              updatedAt: Date.now(),
+            },
+          },
+        };
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Image generation failed.';
+      setScreenplay(prev => {
+        const current = prev.storyboards?.[sceneId];
+        if (!current) return prev;
+        return {
+          ...prev,
+          storyboards: {
+            ...prev.storyboards,
+            [sceneId]: {
+              ...current,
+              shots: current.shots.map(item => item.id === shotId
+                ? {
+                    ...item,
+                    image: {
+                      ...item.image,
+                      status: 'failed',
+                      error: message,
+                    },
+                  }
+                : item),
+              updatedAt: Date.now(),
+            },
+          },
+        };
+      });
+      throw error;
+    }
+  }, [screenplay, setScreenplay]);
 
 
   // Snapshot handlers
@@ -474,10 +699,9 @@ function App() {
   const handleRestoreSnapshot = useCallback(async (snapshotId: string) => {
     const updated = await restoreFromSnapshot(screenplay, snapshotId);
     if (updated) {
-      setScreenplay(updated);
-      clearHistory();
+      resetState(updated);
     }
-  }, [screenplay, setScreenplay, clearHistory]);
+  }, [screenplay, resetState]);
 
   const handleDeleteSnapshot = useCallback(async (snapshotId: string) => {
     const updated = await deleteSnapshot(screenplay, snapshotId);
@@ -551,7 +775,9 @@ function App() {
 
   // Track writing progress when screenplay changes
   useEffect(() => {
-    if (writingGoal && screenplay.id) {
+    if (!writingGoal || !screenplay.id) return;
+
+    const timeoutId = window.setTimeout(() => {
       (async () => {
         try {
           const updatedSession = await updateTodaySession(screenplay.id, screenplay.elements, writingGoal);
@@ -567,7 +793,9 @@ function App() {
           console.error('Failed to update writing session:', error);
         }
       })();
-    }
+    }, 1500);
+
+    return () => window.clearTimeout(timeoutId);
   }, [screenplay.elements, screenplay.id, writingGoal]);
 
   // Cycle theme - toggle between dark and light (skip system for direct toggle)
@@ -589,6 +817,25 @@ function App() {
     localStorage.setItem('screenwriter_ai_enabled', String(enabled));
   }, []);
 
+  const toggleAIChatPanel = useCallback(() => {
+    setShowAIChat(previous => {
+      const next = !previous;
+      if (next) {
+        setHasOpenedAIChat(true);
+        setShowNotesPanel(false);
+      }
+      return next;
+    });
+  }, []);
+
+  const toggleNotesPanel = useCallback(() => {
+    setShowNotesPanel(previous => {
+      const next = !previous;
+      if (next) setShowAIChat(false);
+      return next;
+    });
+  }, []);
+
   // Apply AI command result
   const handleApplyAIResult = useCallback((elementId: string, newContent: string) => {
     setScreenplay(prev => ({
@@ -601,141 +848,84 @@ function App() {
 
   // Inline AI Edit Handlers
   const handleProposeEdits = useCallback((edits: PendingEdit[]) => {
+    if (edits.length === 0) return;
+    const reconciledEdits = reconcilePendingEdits(edits, screenplayElementsRef.current);
     setPendingEdits(prev => {
       const next = new Map(prev);
-      edits.forEach(edit => next.set(edit.elementId, edit));
+      reconciledEdits.forEach(edit => next.set(edit.elementId, edit));
       return next;
     });
+    setReviewElementId(current => current ?? reconciledEdits[0].elementId);
   }, []);
 
+  const pendingEditList = useMemo(() => {
+    const elementOrder = new Map(screenplay.elements.map((element, index) => [element.id, index]));
+    return Array.from(pendingEdits.entries())
+      .sort(([leftId], [rightId]) =>
+        (elementOrder.get(leftId) ?? Number.MAX_SAFE_INTEGER)
+        - (elementOrder.get(rightId) ?? Number.MAX_SAFE_INTEGER)
+      );
+  }, [pendingEdits, screenplay.elements]);
+
+  const currentReviewIndex = Math.max(
+    0,
+    pendingEditList.findIndex(([elementId]) => elementId === reviewElementId),
+  );
+  const currentReviewEntry = pendingEditList[currentReviewIndex];
+  const currentReviewElement = currentReviewEntry
+    ? screenplay.elements.find(element => element.id === currentReviewEntry[0])
+    : undefined;
+  const currentReviewIsStale = Boolean(
+    currentReviewEntry
+    && (!currentReviewElement || currentReviewElement.content !== currentReviewEntry[1].originalContent)
+  );
+  const hasStalePendingEdit = pendingEditList.some(([elementId, edit]) => {
+    const element = screenplay.elements.find(candidate => candidate.id === elementId);
+    return !element || element.content !== edit.originalContent;
+  });
+
+  const focusReviewEdit = useCallback((elementId: string) => {
+    setReviewElementId(elementId);
+  }, []);
+
+  useEffect(() => {
+    if (reviewElementId) setFocusedElementId(reviewElementId);
+  }, [reviewElementId]);
+
+  const moveReview = useCallback((direction: -1 | 1) => {
+    if (pendingEditList.length === 0) return;
+    const nextIndex = Math.min(
+      pendingEditList.length - 1,
+      Math.max(0, currentReviewIndex + direction),
+    );
+    focusReviewEdit(pendingEditList[nextIndex][0]);
+  }, [currentReviewIndex, focusReviewEdit, pendingEditList]);
+
+  const advanceAfterDecision = useCallback((elementId: string) => {
+    const decisionIndex = pendingEditList.findIndex(([id]) => id === elementId);
+    const remaining = pendingEditList.filter(([id]) => id !== elementId);
+    const nextEntry = remaining[Math.min(Math.max(decisionIndex, 0), remaining.length - 1)];
+    if (nextEntry) {
+      focusReviewEdit(nextEntry[0]);
+    } else {
+      setReviewElementId(null);
+    }
+  }, [focusReviewEdit, pendingEditList]);
+
   const handleAcceptEdit = useCallback((elementId: string) => {
-    setPendingEdits(prev => {
-      const edit = prev.get(elementId);
-      if (!edit) {
-        console.warn('No edit found for', elementId);
-        return prev;
-      }
+    const edit = pendingEdits.get(elementId);
+    if (!edit) return;
+    const currentElement = screenplay.elements.find(element => element.id === elementId);
+    if (!currentElement || currentElement.content !== edit.originalContent) return;
 
-      // Parse the new content to check for multiple elements
-      // Split by double newline which typically separates elements in Fountain/screenplays
-
-      // Check if this is a simple update (single element) or complex (multiple elements)
-      // Complex if: multiple parts in newContent OR newElements array exists
-      // We need to check parts.length, so split here
-      const parts = edit.newContent.split(/\n\n+/);
-      const isSimpleUpdate = parts.length <= 1 && (!edit.newElements || edit.newElements.length === 0);
-
-      if (isSimpleUpdate) {
-        // Simple update if only one part and no new elements
-        setScreenplay(sp => ({
-          ...sp,
-          elements: sp.elements.map(el =>
-            el.id === elementId ? { ...el, content: edit.newContent } : el
-          )
-        }));
-      } else {
-        // Complex update: split into multiple elements
-        setScreenplay(sp => {
-          const index = sp.elements.findIndex(el => el.id === elementId);
-          if (index === -1) return sp;
-
-          const oldElement = sp.elements[index];
-
-          // Check if this is an insert-only operation (no actual edit to the element)
-          const isInsertOnly = edit.originalContent === edit.newContent;
-
-          // Only update the element content if it actually changed
-          const updatedFirstElement = isInsertOnly
-            ? oldElement  // Keep original element unchanged
-            : { ...oldElement, content: edit.newContent };  // Update with new content
-
-          const newElements: ScriptElement[] = [];
-
-          // Check if we have structured elements from the AI
-          if (edit.newElements && edit.newElements.length > 0) {
-            // Use structured elements directly - no parsing needed!
-            for (const structuredEl of edit.newElements) {
-              newElements.push({
-                id: uuidv4(),
-                type: structuredEl.type,
-                content: structuredEl.content
-              });
-            }
-          } else {
-            // Fallback: parse newContent for backward compatibility
-            // First part updates the existing element
-            const firstContent = parts[0];
-            updatedFirstElement.content = firstContent;
-
-            // Subsequent parts become new elements - use heuristics
-            for (let i = 1; i < parts.length; i++) {
-              const content = parts[i].trim();
-              if (!content) continue;
-
-              let type: ElementType = 'action';
-
-              // Simple heuristics for element type
-              if (content === content.toUpperCase() && content.length < 50) {
-                type = 'character';
-              } else if (content.startsWith('(') && content.endsWith(')')) {
-                type = 'parenthetical';
-              } else if (content.toUpperCase().startsWith('INT.') || content.toUpperCase().startsWith('EXT.')) {
-                type = 'scene-heading';
-              } else {
-                // If previous was character, this is likely dialogue
-                const prevType = newElements.length > 0
-                  ? newElements[newElements.length - 1].type
-                  : (i === 1 ? updatedFirstElement.type : 'action');
-
-                if (prevType === 'character') {
-                  type = 'dialogue';
-                } else if (prevType === 'dialogue') {
-                  type = 'action';
-                }
-              }
-
-              // Special case: if the AI output "Character\nDialogue", split that too
-              if (content.includes('\n') && type === 'action') {
-                const subParts = content.split('\n');
-                if (subParts.length === 2 && subParts[0] === subParts[0].toUpperCase()) {
-                  // It's likely Character\nDialogue
-                  newElements.push({
-                    id: uuidv4(),
-                    type: 'character',
-                    content: subParts[0].trim()
-                  });
-                  newElements.push({
-                    id: uuidv4(),
-                    type: 'dialogue',
-                    content: subParts[1].trim()
-                  });
-                  continue;
-                }
-              }
-
-              newElements.push({
-                id: uuidv4(),
-                type,
-                content
-              });
-            }
-          }
-
-          const newElementList = [...sp.elements];
-          newElementList.splice(index, 1, updatedFirstElement, ...newElements);
-
-          return {
-            ...sp,
-            elements: newElementList
-          };
-        });
-      }
-      // Remove from pending
-      const next = new Map(prev);
+    setScreenplay(current => applyPendingEdit(current, elementId, edit));
+    setPendingEdits(current => {
+      const next = new Map(current);
       next.delete(elementId);
       return next;
     });
-  }, [setScreenplay]);
+    advanceAfterDecision(elementId);
+  }, [advanceAfterDecision, pendingEdits, screenplay.elements, setScreenplay]);
 
   const handleRejectEdit = useCallback((elementId: string) => {
     setPendingEdits(prev => {
@@ -743,6 +933,31 @@ function App() {
       next.delete(elementId);
       return next;
     });
+    advanceAfterDecision(elementId);
+  }, [advanceAfterDecision]);
+
+  const handleAcceptAllEdits = useCallback(() => {
+    const validEdits = pendingEditList.filter(([elementId, edit]) =>
+      screenplay.elements.some(element =>
+        element.id === elementId && element.content === edit.originalContent
+      )
+    );
+    if (validEdits.length !== pendingEditList.length) return;
+
+    setScreenplay(current =>
+      validEdits.reduce(
+        (nextScreenplay, [elementId, edit]) =>
+          applyPendingEdit(nextScreenplay, elementId, edit),
+        current,
+      )
+    );
+    setPendingEdits(new Map());
+    setReviewElementId(null);
+  }, [pendingEditList, screenplay.elements, setScreenplay]);
+
+  const handleRejectAllEdits = useCallback(() => {
+    setPendingEdits(new Map());
+    setReviewElementId(null);
   }, []);
 
   // Script notes handlers
@@ -815,9 +1030,23 @@ function App() {
       }
 
       // Find: Cmd/Ctrl+F
-      if (modKey && e.key === 'f') {
+      if (modKey && e.key === 'f' && !e.shiftKey) {
         e.preventDefault();
         setShowFindReplace(true);
+        return;
+      }
+
+      // New screenplay: Cmd/Ctrl+N
+      if (modKey && e.key === 'n') {
+        e.preventDefault();
+        handleNew();
+        return;
+      }
+
+      // Help is available even while editing.
+      if (e.key === 'F1') {
+        e.preventDefault();
+        setShowHelp(previous => !previous);
         return;
       }
 
@@ -852,10 +1081,7 @@ function App() {
       // Cmd/Ctrl+/: Toggle AI Chat
       if (modKey && e.key === '/' && aiEnabled) {
         e.preventDefault();
-        if (showBeatBoard) {
-          return;
-        }
-        setShowAIChat(prev => !prev);
+        toggleAIChatPanel();
         return;
       }
 
@@ -875,6 +1101,8 @@ function App() {
           setShowAICommand(false);
         } else if (showAIChat) {
           setShowAIChat(false);
+        } else if (showNotesPanel) {
+          setShowNotesPanel(false);
         } else if (distractionFree) {
           setDistractionFree(false);
         } else {
@@ -890,7 +1118,7 @@ function App() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [undo, redo, toggleDistractionFree, toggleTypewriterMode, toggleFocusMode, distractionFree, aiEnabled, showAICommand, showAIChat, showBeatBoard]);
+  }, [undo, redo, handleNew, toggleDistractionFree, toggleTypewriterMode, toggleFocusMode, toggleAIChatPanel, distractionFree, aiEnabled, showAICommand, showAIChat, showNotesPanel, showBeatBoard]);
 
   const pageCount = estimatePageCount(screenplay);
 
@@ -990,32 +1218,81 @@ function App() {
 
   const openBeatBoard = useCallback((beatId?: string) => {
     setBeatBoardSelectedBeatId(beatId ?? null);
-    setShowAIChat(false);
+    setBeatBoardView('board');
+    setShowNotesPanel(false);
     setShowAICommand(false);
+    setShowStoryboard(false);
     setShowBeatBoard(true);
   }, []);
 
+  const currentSceneId = useMemo(() => {
+    const targetId = activeElementId ?? focusedElementId;
+    const targetIndex = targetId
+      ? screenplay.elements.findIndex(element => element.id === targetId)
+      : -1;
+    for (let index = targetIndex >= 0 ? targetIndex : 0; index >= 0; index--) {
+      if (screenplay.elements[index]?.type === 'scene-heading') {
+        return screenplay.elements[index].id;
+      }
+    }
+    return screenplay.elements.find(element => element.type === 'scene-heading')?.id || null;
+  }, [activeElementId, focusedElementId, screenplay.elements]);
+
+  const openStoryboard = useCallback((sceneId?: string | null) => {
+    setStoryboardSceneId(sceneId || currentSceneId);
+    setShowNotesPanel(false);
+    setShowAICommand(false);
+    setShowBeatBoard(false);
+    setShowStoryboard(true);
+  }, [currentSceneId]);
+
+  const requestStoryboardAI = useCallback((sceneId: string) => {
+    setStoryboardSceneId(sceneId);
+    setRequestedAIChatMode('storyboard');
+    setRequestedAIChatPrompt({
+      id: uuidv4(),
+      content: 'Create a complete visual shot list for the current scene. Use the screenplay, treatment, beats, adjacent scenes, and existing storyboard context to preserve tone and continuity.',
+    });
+    setShowAIChat(true);
+    setHasOpenedAIChat(true);
+  }, []);
+
+  const handleAIChatModeChange = useCallback((mode: AIChatMode) => {
+    setRequestedAIChatMode(undefined);
+    if (mode === 'outline') {
+      setShowNotesPanel(false);
+      setShowAIChat(true);
+      setHasOpenedAIChat(true);
+      setBeatBoardView('board');
+      setShowStoryboard(false);
+      setShowBeatBoard(true);
+    } else if (mode === 'storyboard') {
+      setShowNotesPanel(false);
+      setShowAIChat(true);
+      setHasOpenedAIChat(true);
+      setShowBeatBoard(false);
+      setShowStoryboard(true);
+      setStoryboardSceneId(currentSceneId);
+    } else {
+      setShowBeatBoard(false);
+      setBeatBoardSelectedBeatId(null);
+      setShowStoryboard(false);
+    }
+  }, [currentSceneId]);
+
   return (
     <div
-      className={`app ${showAIChat ? 'ai-chat-open' : ''} ${distractionFree ? 'distraction-free' : ''}`}
-      style={{ '--ai-panel-width': `${aiPanelWidth}px` } as React.CSSProperties}
+      className={`app ${showAIChat ? 'ai-chat-open' : ''} ${showNotesPanel ? 'notes-panel-open' : ''} ${showBeatBoard ? 'beat-board-open' : ''} ${showStoryboard ? 'storyboard-open' : ''} ${distractionFree ? 'distraction-free' : ''}`}
+      style={{
+        '--ai-panel-width': `${aiPanelWidth}px`,
+        '--right-panel-width': showAIChat ? `${aiPanelWidth}px` : '360px',
+      } as React.CSSProperties}
     >
-      {showBeatBoard ? (
-        <BeatBoard
-          projectId={screenplay.id}
-          beats={screenplay.beats || []}
-          beatStructure={screenplay.beatStructure || 'three-act'}
-          elements={screenplay.elements}
-          onBeatsChange={handleBeatsChange}
-          onStructureChange={handleBeatStructureChange}
-          selectedBeatId={beatBoardSelectedBeatId}
-          onClose={() => {
-            setShowBeatBoard(false);
-            setBeatBoardSelectedBeatId(null);
-          }}
-        />
-      ) : (
-        <>
+      {!isHydrated && (
+        <div className="startup-loading" role="status" aria-live="polite">
+          Loading screenplay…
+        </div>
+      )}
       <Header
         title={screenplay.title}
         author={screenplay.author}
@@ -1030,6 +1307,7 @@ function App() {
         onShowTitlePage={() => setShowTitlePage(true)}
         onShowStatistics={() => setShowStatistics(true)}
         onShowBeatBoard={() => openBeatBoard()}
+        onShowStoryboard={() => openStoryboard()}
         onShowSnapshots={() => setShowSnapshots(true)}
         onUndo={undo}
         onRedo={redo}
@@ -1041,7 +1319,7 @@ function App() {
         distractionFree={distractionFree}
         onToggleDistractionFree={toggleDistractionFree}
         aiEnabled={aiEnabled}
-        onToggleAIChat={() => setShowAIChat(prev => !prev)}
+        onToggleAIChat={toggleAIChatPanel}
         onShowAISettings={() => setShowAISettings(true)}
         showAIChat={showAIChat}
         sceneNumberingEnabled={screenplay.sceneNumberingEnabled}
@@ -1050,7 +1328,7 @@ function App() {
         onToggleScenesLocked={handleToggleScenesLocked}
         onShowRevisions={() => setShowRevisions(true)}
         onShowPrintPreview={() => setShowPrintPreview(true)}
-        onShowNotesPanel={() => setShowNotesPanel(prev => !prev)}
+        onShowNotesPanel={toggleNotesPanel}
         onExportFdx={handleExportFdx}
         showNotesPanel={showNotesPanel}
         totalDuration={totalDuration}
@@ -1062,7 +1340,13 @@ function App() {
         goalProgress={goalProgress}
         onShowCharacterTracker={() => setShowCharacterTracker(true)}
         onShowSceneCompare={() => setShowSceneCompare(true)}
+        saveStatus={saveStatus}
       />
+      <div
+        ref={screenplayWorkspaceRef}
+        className="screenplay-workspace"
+        aria-hidden={showBeatBoard || showStoryboard || undefined}
+      >
       <div className="main-content">
         <SceneNavigator
           scenes={scenes}
@@ -1091,14 +1375,71 @@ function App() {
             focusMode={focusMode}
             // Inline AI Edits
             pendingEdits={pendingEdits}
-            onAcceptEdit={handleAcceptEdit}
-            onRejectEdit={handleRejectEdit}
+            reviewElementId={currentReviewEntry?.[0] || null}
             // Track active element for notes panel
             onActiveElementChange={setActiveElementId}
           />
         </div>
       </div>
-        </>
+      {currentReviewEntry && (
+        <EditReviewBar
+          current={currentReviewIndex + 1}
+          total={pendingEditList.length}
+          edit={currentReviewEntry[1]}
+          label={currentReviewElement ? ELEMENT_LABELS[currentReviewElement.type] : 'Screenplay element'}
+          hasPrevious={currentReviewIndex > 0}
+          hasNext={currentReviewIndex < pendingEditList.length - 1}
+          isStale={currentReviewIsStale}
+          hasConflicts={hasStalePendingEdit}
+          onPrevious={() => moveReview(-1)}
+          onNext={() => moveReview(1)}
+          onAccept={() => handleAcceptEdit(currentReviewEntry[0])}
+          onReject={() => handleRejectEdit(currentReviewEntry[0])}
+          onAcceptAll={handleAcceptAllEdits}
+          onRejectAll={handleRejectAllEdits}
+        />
+      )}
+      </div>
+      {showBeatBoard && (
+        <div className="beat-board-overlay" role="region" aria-label="Story outline">
+          <Suspense fallback={<ToolLoadingFallback />}>
+            <BeatBoard
+              beats={screenplay.beats || []}
+              beatStructure={screenplay.beatStructure || 'three-act'}
+              elements={screenplay.elements}
+              treatment={screenplay.treatment || ''}
+              onBeatsChange={handleBeatsChange}
+              onTreatmentChange={handleTreatmentChange}
+              onStructureChange={handleBeatStructureChange}
+              activeView={beatBoardView}
+              onViewChange={setBeatBoardView}
+              selectedBeatId={beatBoardSelectedBeatId}
+              onClose={() => {
+                setShowBeatBoard(false);
+                setBeatBoardSelectedBeatId(null);
+              }}
+            />
+          </Suspense>
+        </div>
+      )}
+      {showStoryboard && (
+        <div className="scene-storyboard-overlay" role="region" aria-label="Scene storyboard">
+          <Suspense fallback={<ToolLoadingFallback />}>
+            <SceneStoryboard
+              elements={screenplay.elements}
+              storyboards={screenplay.storyboards || {}}
+              initialSceneId={storyboardSceneId}
+              onStoryboardsChange={handleStoryboardsChange}
+              onRequestAI={requestStoryboardAI}
+              onGenerateShot={handleGenerateStoryboardShot}
+              onJumpToScene={(sceneId) => {
+                setShowStoryboard(false);
+                handleFocusElement(sceneId);
+              }}
+              onClose={() => setShowStoryboard(false)}
+            />
+          </Suspense>
+        </div>
       )}
       <KeyboardHelp isOpen={showHelp} onClose={() => setShowHelp(false)} />
       <FindReplace
@@ -1117,65 +1458,84 @@ function App() {
         onNewProject={handleNew}
         onDeleteProject={handleDeleteProject}
       />
-      <TitlePageEditor
-        isOpen={showTitlePage}
-        onClose={() => setShowTitlePage(false)}
-        data={titlePageData}
-        onSave={handleSaveTitlePage}
-      />
-      <Statistics
-        isOpen={showStatistics}
-        onClose={() => setShowStatistics(false)}
-        elements={screenplay.elements}
-        pageCount={pageCount}
-      />
+      <Suspense fallback={<ToolLoadingFallback />}>
+        {showTitlePage && (
+          <TitlePageEditor
+            isOpen
+            onClose={() => setShowTitlePage(false)}
+            data={titlePageData}
+            onSave={handleSaveTitlePage}
+          />
+        )}
+        {showStatistics && (
+          <Statistics
+            isOpen
+            onClose={() => setShowStatistics(false)}
+            elements={screenplay.elements}
+            pageCount={pageCount}
+          />
+        )}
+      </Suspense>
 
       {/* AI Features */}
-      {!showBeatBoard && (
-      <AIChat
-        isOpen={showAIChat}
-        onClose={() => setShowAIChat(false)}
-        elements={screenplay.elements}
-        beats={screenplay.beats || []}
-        beatStructure={screenplay.beatStructure || 'three-act'}
-        // Prefer the editor's currently active element; fall back to navigator-driven focus.
-        currentElementId={activeElementId ?? focusedElementId}
-        onProposeEdits={handleProposeEdits}
-        onApplyBeatOps={handleApplyBeatOps}
-        projectId={screenplay.id}
-        pendingEdits={pendingEdits}
-        onJumpToElement={handleFocusElement}
-        onAcceptEdit={handleAcceptEdit}
-        onRejectEdit={handleRejectEdit}
-        width={aiPanelWidth}
-        onWidthChange={setAIPanelWidth}
-      />
+      {hasOpenedAIChat && (
+        <Suspense fallback={showAIChat ? <RightPanelLoadingFallback /> : null}>
+          <AIChat
+            isOpen={showAIChat}
+            onClose={() => setShowAIChat(false)}
+            screenplay={screenplay}
+            // Prefer the editor's currently active element; fall back to navigator-driven focus.
+            currentElementId={showStoryboard && storyboardSceneId
+              ? storyboardSceneId
+              : activeElementId ?? focusedElementId}
+            onProposeEdits={handleProposeEdits}
+            onApplyBeatOps={handleApplyBeatOps}
+            onApplyStoryboardOps={handleApplyStoryboardOps}
+            projectId={screenplay.id}
+            pendingEdits={pendingEdits}
+            onJumpToElement={handleFocusElement}
+            width={aiPanelWidth}
+            onWidthChange={setAIPanelWidth}
+            onModeChange={handleAIChatModeChange}
+            requestedMode={requestedAIChatMode}
+            requestedPrompt={requestedAIChatPrompt}
+          />
+        </Suspense>
       )}
-      <AICommandPalette
-        isOpen={showAICommand}
-        onClose={() => setShowAICommand(false)}
-        selectedElement={selectedElement}
-        precedingElements={precedingElements}
-        onApplyResult={handleApplyAIResult}
-      />
-      <AISettings
-        isOpen={showAISettings}
-        onClose={() => setShowAISettings(false)}
-        aiEnabled={aiEnabled}
-        onToggleAI={toggleAI}
-      />
+      <Suspense fallback={<ToolLoadingFallback />}>
+        {showAICommand && (
+          <AICommandPalette
+            isOpen
+            onClose={() => setShowAICommand(false)}
+            selectedElement={selectedElement}
+            precedingElements={precedingElements}
+            onApplyResult={handleApplyAIResult}
+          />
+        )}
+        {showAISettings && (
+          <AISettings
+            isOpen
+            onClose={() => setShowAISettings(false)}
+            aiEnabled={aiEnabled}
+            onToggleAI={toggleAI}
+          />
+        )}
+      </Suspense>
 
       {/* Writing Goals */}
-      <WritingGoals
-        isOpen={showWritingGoals}
-        onClose={() => setShowWritingGoals(false)}
-        goal={writingGoal}
-        sessions={writingSessions}
-        currentStreak={currentStreak}
-        longestStreak={longestStreak}
-        todayProgress={goalProgress || { current: 0, target: 3 }}
-        onUpdateGoal={handleUpdateWritingGoal}
-      />
+      <Suspense fallback={<ToolLoadingFallback />}>
+        {showWritingGoals && (
+          <WritingGoals
+            isOpen
+            onClose={() => setShowWritingGoals(false)}
+            goal={writingGoal}
+            sessions={writingSessions}
+            currentStreak={currentStreak}
+            longestStreak={longestStreak}
+            todayProgress={goalProgress || { current: 0, target: 3 }}
+            onUpdateGoal={handleUpdateWritingGoal}
+          />
+        )}
 
       {/* Character Tracker */}
       {showCharacterTracker && (
@@ -1223,11 +1583,14 @@ function App() {
       )}
 
       {/* Print Preview */}
-      <PrintPreview
-        isOpen={showPrintPreview}
-        onClose={() => setShowPrintPreview(false)}
-        screenplay={screenplay}
-      />
+        {showPrintPreview && (
+          <PrintPreview
+            isOpen
+            onClose={() => setShowPrintPreview(false)}
+            screenplay={screenplay}
+          />
+        )}
+      </Suspense>
 
       {/* Notes Panel */}
       <NotesPanel

@@ -4,6 +4,7 @@ openai>=2.26.0,<3.0.0
 python-dotenv>=1.0.0
 pydantic>=2.10,<3.0.0
 python-multipart>=0.0.9
+boto3>=1.35.0,<2.0.0
 openai-agents==0.17.3
 asyncpg==0.29.0
 langfuse>=2.0.0,<3.0.0

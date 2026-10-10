@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useMemo, useCallback } from 'react';
+import { useState, useRef, useEffect, useLayoutEffect, useMemo, useCallback } from 'react';
 import { Marked } from 'marked';
 import {
   X,
@@ -16,42 +16,61 @@ import {
   Bot,
   Edit3,
   MessageCircle,
+  ListTree,
   Check,
   ChevronDown,
   ChevronRight,
   Loader2,
+  Clapperboard,
 } from 'lucide-react';
 import { useAIChat } from '../hooks/useAIChat';
 import {
   PendingEdit,
   ScriptElement,
+  Screenplay,
   ELEMENT_LABELS,
   ElementType,
-  Beat,
-  BeatStructure,
-  BEAT_STRUCTURES,
 } from '../types';
-import type { AIStreamEvent, PlanState, TodoItem, BeatOp } from '../services/aiClient';
+import type {
+  AIChatMode,
+  AIStreamEvent,
+  PlanState,
+  TodoItem,
+  BeatOp,
+  StoryboardOp,
+} from '../services/aiClient';
+import { buildFullScreenplayContext } from '../utils/screenplayContext';
 
 interface AIChatProps {
   isOpen: boolean;
   onClose: () => void;
-  elements: ScriptElement[];
-  beats?: Beat[];
-  beatStructure?: BeatStructure;
+  screenplay: Screenplay;
   currentElementId?: string | null;
   onProposeEdits: (edits: PendingEdit[]) => void;
   onApplyBeatOps?: (ops: BeatOp[]) => void;
+  onApplyStoryboardOps?: (ops: StoryboardOp[]) => void;
   pendingEdits?: Map<string, PendingEdit>;
   onJumpToElement?: (id: string) => void;
-  onAcceptEdit?: (id: string) => void;
-  onRejectEdit?: (id: string) => void;
   width?: number;
   onWidthChange?: (width: number) => void;
   projectId?: string;
+  onModeChange?: (mode: AIChatMode) => void;
+  requestedMode?: AIChatMode;
+  requestedPrompt?: { id: string; content: string };
 }
 
 const marked = new Marked();
+
+type AIModelOption = { id: string; label: string };
+const DEFAULT_MODEL_ID = 'gpt-4.1';
+const MODEL_OPTIONS: AIModelOption[] = [
+  { id: 'gpt-4.1', label: 'gpt-4.1' },
+  { id: 'gpt-5', label: 'gpt-5' },
+  { id: 'gpt-5-mini', label: 'gpt-5-mini' },
+  { id: 'gpt-5.6', label: 'gpt-5.6 Sol' },
+  { id: 'gpt-5.6-terra', label: 'gpt-5.6 Terra' },
+  { id: 'gpt-5.6-luna', label: 'gpt-5.6 Luna' },
+];
 
 const QUICK_PROMPTS = [
   {
@@ -92,45 +111,56 @@ const QUICK_PROMPTS = [
   },
 ];
 
+const OUTLINE_PROMPTS = [
+  { label: 'Build an outline', prompt: 'Help me develop a complete story outline from my current ideas.', icon: ListTree, color: '#8b5cf6' },
+  { label: 'Shape the acts', prompt: 'Review the story structure and propose a strong beat outline across the acts.', icon: Drama, color: '#ec4899' },
+  { label: 'Find missing beats', prompt: 'Analyze the current outline and propose beats that would strengthen the story.', icon: Search, color: '#3b82f6' },
+  { label: 'Improve pacing', prompt: 'Review the outline pacing and propose specific beat changes.', icon: Timer, color: '#ef4444' },
+];
+
+const STORYBOARD_PROMPTS = [
+  { label: 'Storyboard this scene', prompt: 'Create a complete visual shot list for the current scene.', icon: Clapperboard, color: '#8b5cf6' },
+  { label: 'Make it more cinematic', prompt: 'Propose a cinematic shot list that strengthens the visual storytelling in this scene.', icon: Sparkles, color: '#ec4899' },
+  { label: 'Improve coverage', prompt: 'Create practical coverage for this scene, including establishing shots, performance coverage, and key inserts.', icon: Search, color: '#3b82f6' },
+  { label: 'Focus on continuity', prompt: 'Storyboard this scene with detailed visual continuity notes for characters, props, and screen direction.', icon: Timer, color: '#ef4444' },
+];
+
 export default function AIChat({
   isOpen,
   onClose,
-  elements,
-  beats,
-  beatStructure,
+  screenplay,
   currentElementId,
   onProposeEdits,
   onApplyBeatOps,
+  onApplyStoryboardOps,
   pendingEdits,
   onJumpToElement,
-  onAcceptEdit,
-  onRejectEdit,
   width = 400,
   onWidthChange,
   projectId,
+  onModeChange,
+  requestedMode,
+  requestedPrompt,
 }: AIChatProps) {
   // (debug instrumentation removed)
+  const elements = screenplay.elements;
+  const beats = screenplay.beats || [];
 
   const [input, setInput] = useState('');
-  const [mode, setMode] = useState<'ask' | 'edit'>('ask');
+  const [mode, setMode] = useState<AIChatMode>('ask');
   const messagesScrollRef = useRef<HTMLDivElement>(null);
   const isAtBottomRef = useRef<boolean>(true);
   const forceScrollToBottomRef = useRef<boolean>(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const handledRequestedPromptRef = useRef<string | null>(null);
+  const requestedPromptHandlerRef = useRef<(prompt: string) => void>(() => {});
   const [showEditList, setShowEditList] = useState(false);
   const [dismissedBeatOpMessages, setDismissedBeatOpMessages] = useState<Set<number>>(new Set());
+  const [dismissedStoryboardOpMessages, setDismissedStoryboardOpMessages] = useState<Set<number>>(new Set());
   const [selectionSnapshot, setSelectionSnapshot] = useState<string>('');
   const [activeTextareaElementId, setActiveTextareaElementId] = useState<string | null>(null);
   // Beats are always included in AI context (no toggle).
-
-  type AIModelOption = { id: string; label: string };
-  const DEFAULT_MODEL_ID = 'gpt-4.1';
-  const MODEL_OPTIONS: AIModelOption[] = [
-    { id: 'gpt-4.1', label: 'gpt-4.1' },
-    { id: 'gpt-5', label: 'gpt-5' },
-    { id: 'gpt-5-mini', label: 'gpt-5-mini' },
-  ];
 
   const getStoredModel = (): string => {
     try {
@@ -150,13 +180,25 @@ export default function AIChat({
 
   const selectedModelLabel = useMemo(() => {
     return MODEL_OPTIONS.find(o => o.id === model)?.label || model;
-  }, [MODEL_OPTIONS, model]);
+  }, [model]);
 
   const selectModel = useCallback((next: string) => {
     if (!MODEL_OPTIONS.some(o => o.id === next)) return;
     setModel(next);
     try { localStorage.setItem('screenwriter_ai_model', next); } catch {}
-  }, [MODEL_OPTIONS]);
+  }, []);
+
+  const changeMode = useCallback((nextMode: AIChatMode) => {
+    setMode(nextMode);
+    onModeChange?.(nextMode);
+  }, [onModeChange]);
+
+  useEffect(() => {
+    if (requestedMode && requestedMode !== mode) {
+      setMode(requestedMode);
+      onModeChange?.(requestedMode);
+    }
+  }, [mode, onModeChange, requestedMode]);
 
   useEffect(() => {
     if (!isModelMenuOpen) return;
@@ -175,45 +217,19 @@ export default function AIChat({
   const [isDragging, setIsDragging] = useState(false);
   const sidebarRef = useRef<HTMLDivElement>(null);
 
-  const { messages, isStreaming, error, sendMessage, clearMessages, stopStreaming } = useAIChat(
-    elements.map(el => ({ id: el.id, type: el.type, content: el.content })),
-    projectId
+  const chatElements = useMemo(
+    () => elements.map(el => ({ id: el.id, type: el.type, content: el.content })),
+    [elements]
   );
-
-  const beatContextBlock = useMemo(() => {
-    const list = (beats || []).slice();
-    if (!list.length) return '';
-
-    const structure: BeatStructure = beatStructure || 'three-act';
-    const actNames = BEAT_STRUCTURES[structure] || ['Act 1', 'Act 2', 'Act 3'];
-
-    const byAct: Beat[][] = actNames.map(() => []);
-    for (const b of list) {
-      const idx = typeof b.actIndex === 'number' ? b.actIndex : -1;
-      if (idx >= 0 && idx < byAct.length) byAct[idx].push(b);
-    }
-    for (const arr of byAct) arr.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
-
-    const maxPerAct = 8;
-    const maxDesc = 120;
-    const lines: string[] = [];
-    lines.push('Beat Board Context (high-level story intent):');
-    actNames.forEach((actName, actIndex) => {
-      const actBeats = byAct[actIndex] || [];
-      if (!actBeats.length) return;
-      lines.push(`ACT ${actIndex + 1}: ${actName}`);
-      actBeats.slice(0, maxPerAct).forEach((beat, i) => {
-        const title = (beat.title || 'Untitled').trim();
-        const desc = (beat.description || '').trim();
-        const descSnippet = desc.length > maxDesc ? desc.slice(0, maxDesc) + '…' : desc;
-        lines.push(`- [beatId=${beat.id}] #${i + 1} ${title}${descSnippet ? ` — ${descSnippet}` : ''}`);
-      });
-      if (actBeats.length > maxPerAct) lines.push('- … (more beats omitted)');
-      lines.push('');
-    });
-    lines.push('Use beats to ground answers and edits in story structure. If a change conflicts with beats, call it out.');
-    return lines.join('\n') + '\n\n---\n\n';
-  }, [beats, beatStructure]);
+  const fullScreenplayContext = useMemo(
+    () => buildFullScreenplayContext(screenplay),
+    [screenplay]
+  );
+  const { messages, isStreaming, error, sendMessage, clearMessages, stopStreaming } = useAIChat(
+    chatElements,
+    projectId,
+    fullScreenplayContext
+  );
 
   // (debug instrumentation removed)
 
@@ -410,23 +426,28 @@ export default function AIChat({
         }
         lines.push(`[Tool] ${label}`);
       } else if (evt.type === 'tool_result' && (evt as any).tool) {
+        const tool = String((evt as any).tool);
         const count = (evt as any).count;
-        lines.push(`[Tool] ${(evt as any).tool}${typeof count === 'number' ? ` (${count})` : ''}`);
+        lines.push(`[Tool] ${tool} complete${typeof count === 'number' ? ` (${count})` : ''}`);
       } else if (evt.type === 'apply_started') {
         lines.push(`[Applying] ${(evt as any).label || 'Applying edits'}`);
       } else if (evt.type === 'apply_done') {
         lines.push('[Applying] Done');
+      } else if (evt.type === 'agent_done') {
+        const count = Number((evt as any).tool_calls || 0);
+        lines.push(`[Done] ${count > 0 ? `${count} tool call${count === 1 ? '' : 's'}` : 'Response complete'}`);
       }
     }
 
-    // De-dupe consecutive duplicates and keep only the most recent line
+    // De-dupe consecutive duplicates while retaining enough history for the
+    // console to explain how the response was produced.
     const deduped: string[] = [];
     for (const s of lines) {
       const t = String(s || '').trim();
       if (!t) continue;
       if (deduped.length === 0 || deduped[deduped.length - 1] !== t) deduped.push(t);
     }
-    return deduped.slice(-1);
+    return deduped.slice(-12);
   };
 
   type TodoView = { id: string; label: string; status: string; rationale?: string };
@@ -581,16 +602,6 @@ export default function AIChat({
     onJumpToElement?.(elementId);
   };
 
-  const handleAccept = (e: React.MouseEvent, elementId: string) => {
-    e.stopPropagation();
-    onAcceptEdit?.(elementId);
-  };
-
-  const handleReject = (e: React.MouseEvent, elementId: string) => {
-    e.stopPropagation();
-    onRejectEdit?.(elementId);
-  };
-
   // Get current scene context - send full screenplay for better AI understanding
   const getSelectionText = () => {
     try {
@@ -633,7 +644,7 @@ export default function AIChat({
       setSelectionSnapshot(getSelectionText());
       setActiveTextareaElementId(getActiveTextareaElementId());
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+     
   }, [isOpen]);
 
   useEffect(() => {
@@ -667,7 +678,7 @@ export default function AIChat({
       window.removeEventListener('focusin', updateFromSelection);
       if (raf) cancelAnimationFrame(raf);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+     
   }, [isOpen, mode, currentElementId]);
 
   const buildScenePlusAdjacentContext = (
@@ -718,14 +729,13 @@ export default function AIChat({
       .filter(Boolean)
       .slice(0, 3);
 
-    let sceneCount = 0;
     const formatted = windowEls
         .map((el, idx) => {
         const absoluteIdx = startIdx + idx;
-        if (el.type === 'scene-heading') sceneCount++;
-        const prefix = mode === 'edit' ? `Element ${absoluteIdx + 1} (ID: ${el.id}, Type: ${el.type}):` : '';
+        const needsIds = mode === 'edit' || mode === 'storyboard';
+        const prefix = needsIds ? `Element ${absoluteIdx + 1} (ID: ${el.id}, Type: ${el.type}):` : '';
         const tag = `[${el.type.toUpperCase()}] ${el.content}`;
-        return mode === 'edit' ? `${prefix}\n${tag}` : tag;
+        return needsIds ? `${prefix}\n${tag}` : tag;
       })
       .join('\n\n');
 
@@ -744,12 +754,12 @@ export default function AIChat({
         : '';
 
     return {
-      sceneContext: `${beatContextBlock}${selectionBlock}${formatted}`,
+      sceneContext: `${selectionBlock}${formatted}`,
       contextElementIds,
       selectedElementId,
       selectedText: selectedText || undefined,
       sceneHeadings,
-      contextCharCount: (`${beatContextBlock}${selectionBlock}${formatted}`).length,
+      contextCharCount: (`${selectionBlock}${formatted}`).length,
     };
   };
 
@@ -820,11 +830,23 @@ export default function AIChat({
     }
   }, [isOpen]);
 
+  const resizeInput = useCallback((textarea: HTMLTextAreaElement | null) => {
+    if (!textarea) return;
+    textarea.style.height = 'auto';
+    textarea.style.height = `${Math.min(textarea.scrollHeight, 120)}px`;
+    textarea.style.overflowY = textarea.scrollHeight > 120 ? 'auto' : 'hidden';
+  }, []);
+
+  useLayoutEffect(() => {
+    resizeInput(inputRef.current);
+  }, [input, isOpen, resizeInput]);
+
   const handleSend = () => {
     if (!input.trim() || isStreaming) return;
     forceScrollToBottomRef.current = true;
     const selectedText = getSelectionText();
-    const bundle = buildScenePlusAdjacentContext(selectedText, activeTextareaElementId);
+    const contextElementId = mode === 'storyboard' ? currentElementId : activeTextareaElementId;
+    const bundle = buildScenePlusAdjacentContext(selectedText, contextElementId);
     sendMessage(input, bundle.sceneContext, mode, {
       selectedElementId: bundle.selectedElementId,
       selectedText: bundle.selectedText,
@@ -838,7 +860,8 @@ export default function AIChat({
   const handleQuickPrompt = (prompt: string) => {
     forceScrollToBottomRef.current = true;
     const selectedText = getSelectionText();
-    const bundle = buildScenePlusAdjacentContext(selectedText, activeTextareaElementId);
+    const contextElementId = mode === 'storyboard' ? currentElementId : activeTextareaElementId;
+    const bundle = buildScenePlusAdjacentContext(selectedText, contextElementId);
     sendMessage(prompt, bundle.sceneContext, mode, {
       selectedElementId: bundle.selectedElementId,
       selectedText: bundle.selectedText,
@@ -847,6 +870,22 @@ export default function AIChat({
       model,
     });
   };
+  requestedPromptHandlerRef.current = handleQuickPrompt;
+
+  useEffect(() => {
+    if (
+      !isOpen
+      || !requestedPrompt
+      || isStreaming
+      || mode !== 'storyboard'
+      || handledRequestedPromptRef.current === requestedPrompt.id
+    ) {
+      return;
+    }
+
+    handledRequestedPromptRef.current = requestedPrompt.id;
+    requestedPromptHandlerRef.current(requestedPrompt.content);
+  }, [isOpen, isStreaming, mode, requestedPrompt]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -870,6 +909,19 @@ export default function AIChat({
       <div
         className="ai-chat-resize-handle"
         onMouseDown={startResizing}
+        onKeyDown={(event) => {
+          if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+          event.preventDefault();
+          const delta = event.key === 'ArrowLeft' ? 16 : -16;
+          onWidthChange?.(Math.min(700, Math.max(300, width + delta)));
+        }}
+        role="slider"
+        aria-label="Resize AI panel"
+        aria-orientation="vertical"
+        aria-valuemin={300}
+        aria-valuemax={700}
+        aria-valuenow={width}
+        tabIndex={0}
       />
 
       {/* Minimal header with mode toggle and actions */}
@@ -877,7 +929,7 @@ export default function AIChat({
         <div className="ai-mode-toggle">
           <button
             className={`ai-mode-btn ${mode === 'ask' ? 'active' : ''}`}
-            onClick={() => setMode('ask')}
+            onClick={() => changeMode('ask')}
             title="Ask mode - Chat only"
           >
             <MessageCircle size={14} />
@@ -885,11 +937,27 @@ export default function AIChat({
           </button>
           <button
             className={`ai-mode-btn ${mode === 'edit' ? 'active' : ''}`}
-            onClick={() => setMode('edit')}
+            onClick={() => changeMode('edit')}
             title="Edit mode - AI can propose edits"
           >
             <Edit3 size={14} />
             <span>Edit</span>
+          </button>
+          <button
+            className={`ai-mode-btn ${mode === 'outline' ? 'active' : ''}`}
+            onClick={() => changeMode('outline')}
+            title="Outline mode - Develop beats and story structure"
+          >
+            <ListTree size={14} />
+            <span>Outline</span>
+          </button>
+          <button
+            className={`ai-mode-btn ${mode === 'storyboard' ? 'active' : ''}`}
+            onClick={() => changeMode('storyboard')}
+            title="Storyboard mode - Develop visual shot lists"
+          >
+            <Clapperboard size={14} />
+            <span>Shots</span>
           </button>
         </div>
         <div className="ai-header-actions">
@@ -1003,11 +1071,28 @@ export default function AIChat({
             <div className="ai-welcome-icon">
               <Sparkles size={32} />
             </div>
-            <h4>How can I help?</h4>
-            <p>Ask me anything about your screenplay, or try one of these:</p>
+            <h4>
+              {mode === 'outline'
+                ? 'Develop your story'
+                : mode === 'storyboard'
+                  ? 'Visualize this scene'
+                  : 'How can I help?'}
+            </h4>
+            <p>
+              {mode === 'outline'
+                ? 'Shape the premise, structure, and beats alongside your outline.'
+                : mode === 'storyboard'
+                  ? 'Turn the current scene into an editable visual shot list.'
+                  : 'Ask me anything about your screenplay, or try one of these:'}
+            </p>
 
             <div className="ai-quick-prompts-grid">
-              {QUICK_PROMPTS.map((qp, i) => {
+              {(mode === 'outline'
+                ? OUTLINE_PROMPTS
+                : mode === 'storyboard'
+                  ? STORYBOARD_PROMPTS
+                  : QUICK_PROMPTS
+              ).map((qp, i) => {
                 const Icon = qp.icon;
                 return (
                   <button
@@ -1029,21 +1114,18 @@ export default function AIChat({
           const hasEdits = msg.edits && msg.edits.length > 0;
           const isLastMessage = i === messages.length - 1;
           const isStreamingEdit = isStreaming && isLastMessage && mode === 'edit' && msg.role === 'assistant';
-          const isStreamingAsk = isStreaming && isLastMessage && mode === 'ask' && msg.role === 'assistant';
+          const isStreamingAsk = isStreaming && isLastMessage && mode !== 'edit' && msg.role === 'assistant';
           
           const progressSource = msg.content ? stripJSONFromContent(msg.content) : '';
           const progressSteps = (() => {
-            if (!(mode === 'edit' || mode === 'ask')) return [];
             const fromEvents = timelineLinesFromEvents(msg.events);
             if (fromEvents.length > 0) return fromEvents;
             return progressSource ? extractProgressSteps(progressSource) : [];
           })();
           const rawTodoItems = (() => {
-            if (!(mode === 'edit' || mode === 'ask')) return [];
             return extractTodosFromEvents(msg.events);
           })();
           const activePlan = (() => {
-            if (!(mode === 'edit' || mode === 'ask')) return null;
             return extractPlanFromEvents(msg.events);
           })();
           const hasFinalPlanEvent = planHasFinalEvent(msg.events);
@@ -1205,12 +1287,23 @@ export default function AIChat({
                   </div>
                 )}
 
-                {/* Progress timeline (Cursor-like): show only the current step (latest) */}
-                {(isStreamingEdit || (isStreamingAsk && !displayContent)) && progressSteps.length > 0 && (
-                  <div className="ai-progress">
-                    <div className="ai-progress-line ai-progress-line--active">
-                      {progressSteps[progressSteps.length - 1]}
-                    </div>
+                {/* Keep the ordered event timeline visible after completion so
+                    users can inspect what the agent actually did. */}
+                {msg.role === 'assistant' && progressSteps.length > 0 && (
+                  <div className="ai-progress" aria-label="AI activity timeline">
+                    {progressSteps.map((step, stepIndex) => {
+                      const isActive =
+                        (isStreamingEdit || isStreamingAsk) &&
+                        stepIndex === progressSteps.length - 1;
+                      return (
+                        <div
+                          key={`${stepIndex}-${step}`}
+                          className={`ai-progress-line ${isActive ? 'ai-progress-line--active' : ''}`}
+                        >
+                          {step}
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
 
@@ -1229,6 +1322,14 @@ export default function AIChat({
                             <div
                               className={`ai-edit-loading ${isComplete ? 'ai-edit-complete' : ''} ${isComplete ? 'ai-edit-clickable' : ''}`}
                               onClick={isComplete ? () => handleJumpToEdit(elementId) : undefined}
+                              onKeyDown={isComplete ? (event) => {
+                                if (event.key === 'Enter' || event.key === ' ') {
+                                  event.preventDefault();
+                                  handleJumpToEdit(elementId);
+                                }
+                              } : undefined}
+                              role={isComplete ? 'button' : undefined}
+                              tabIndex={isComplete ? 0 : undefined}
                               style={isComplete ? { cursor: 'pointer' } : undefined}
                               title={isComplete ? 'Click to jump to edit' : undefined}
                             >
@@ -1266,7 +1367,11 @@ export default function AIChat({
                   msg.beatOps.length > 0 &&
                   !dismissedBeatOpMessages.has(i) && (
                   <div className="beat-ai-suggestion">
-                    <div className="beat-ai-suggestion-header">Proposed beat changes</div>
+                    <div className="beat-ai-suggestion-header">
+                      {msg.beatOps.some(op => op.op === 'set_treatment')
+                        ? 'Proposed outline changes'
+                        : 'Proposed beat changes'}
+                    </div>
                     <div className="beat-ai-suggestion-desc">
                       {msg.beatOps.slice(0, 20).map((op, opIdx) => {
                         let title = '';
@@ -1295,6 +1400,12 @@ export default function AIChat({
                           title = beat?.title || op.id;
                           description = beat?.description || '';
                           actionLabel = 'Delete';
+                        } else if (op.op === 'set_treatment') {
+                          title = 'Screenplay treatment';
+                          description = op.treatment.length > 600
+                            ? `${op.treatment.slice(0, 600)}…`
+                            : op.treatment;
+                          actionLabel = 'Replace treatment';
                         }
 
                         return (
@@ -1328,13 +1439,89 @@ export default function AIChat({
                           setDismissedBeatOpMessages(prev => new Set(prev).add(i));
                         }}
                         disabled={!onApplyBeatOps}
-                        title="Apply all proposed beat changes"
+                        title="Apply all proposed outline changes"
                       >
-                        Apply all to beat board
+                        Apply outline changes
                       </button>
                       <button
                         className="beat-ai-secondary"
                         onClick={() => setDismissedBeatOpMessages(prev => new Set(prev).add(i))}
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {msg.role === 'assistant' &&
+                  msg.storyboardOps &&
+                  msg.storyboardOps.length > 0 &&
+                  !dismissedStoryboardOpMessages.has(i) && (
+                  <div className="beat-ai-suggestion">
+                    <div className="beat-ai-suggestion-header">Proposed storyboard changes</div>
+                    <div className="beat-ai-suggestion-desc">
+                      {msg.storyboardOps.slice(0, 20).map((op, opIdx) => {
+                        const sceneHeading = elements.find(element => element.id === op.sceneId);
+                        const existingStoryboard = screenplay.storyboards?.[op.sceneId];
+                        let actionLabel = '';
+                        let title = '';
+                        let description = op.reason || '';
+
+                        if (op.op === 'replace') {
+                          actionLabel = `Replace shot list · ${op.shots.length} shots`;
+                          title = sceneHeading?.content || 'Selected scene';
+                          description = op.shots.map(shot => shot.title).join(' · ');
+                        } else if (op.op === 'create') {
+                          actionLabel = 'Add shot';
+                          title = op.shot.title;
+                          description = op.shot.action;
+                        } else if (op.op === 'update') {
+                          actionLabel = 'Update shot';
+                          title = op.updates.title
+                            || existingStoryboard?.shots.find(shot => shot.id === op.id)?.title
+                            || op.id;
+                        } else if (op.op === 'move') {
+                          actionLabel = `Move to position ${op.targetOrder + 1}`;
+                          title = existingStoryboard?.shots.find(shot => shot.id === op.id)?.title || op.id;
+                        } else {
+                          actionLabel = 'Delete shot';
+                          title = existingStoryboard?.shots.find(shot => shot.id === op.id)?.title || op.id;
+                        }
+
+                        return (
+                          <div
+                            key={opIdx}
+                            style={{ marginTop: 12, padding: 12, background: 'var(--bg-secondary)', borderRadius: 6 }}
+                          >
+                            <div style={{ fontSize: '0.875rem', fontWeight: 500, color: 'var(--text-primary)', marginBottom: 4 }}>
+                              {actionLabel}
+                            </div>
+                            <div style={{ fontSize: '0.9375rem', fontWeight: 600, color: 'var(--text-primary)' }}>
+                              {title}
+                            </div>
+                            {description && (
+                              <div style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)', marginTop: 4, lineHeight: 1.4 }}>
+                                {description.length > 600 ? `${description.slice(0, 600)}…` : description}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                    <div className="beat-ai-suggestion-actions">
+                      <button
+                        className="beat-ai-primary"
+                        onClick={() => {
+                          onApplyStoryboardOps?.(msg.storyboardOps!);
+                          setDismissedStoryboardOpMessages(prev => new Set(prev).add(i));
+                        }}
+                        disabled={!onApplyStoryboardOps}
+                      >
+                        Apply storyboard changes
+                      </button>
+                      <button
+                        className="beat-ai-secondary"
+                        onClick={() => setDismissedStoryboardOpMessages(prev => new Set(prev).add(i))}
                       >
                         Dismiss
                       </button>
@@ -1394,10 +1581,19 @@ export default function AIChat({
             {showEditList && (
               <div className="ai-edit-summary-list">
                 {pendingEditList.map(({ edit, element }) => (
-                  <button
+                  <div
                     key={edit.elementId}
                     className="ai-edit-summary-row"
                     onClick={() => handleJumpToEdit(edit.elementId)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        handleJumpToEdit(edit.elementId);
+                      }
+                    }}
+                    role="button"
+                    tabIndex={0}
+                    aria-label={`Jump to ${element ? ELEMENT_LABELS[element.type] : 'screenplay element'} edit`}
                   >
                     <div className="ai-edit-summary-row-main">
                       <div className="ai-edit-summary-title">
@@ -1407,25 +1603,8 @@ export default function AIChat({
                         {formatSnippet(edit.reason || edit.newContent || edit.originalContent)}
                       </div>
                     </div>
-                    <div className="ai-edit-summary-actions">
-                      <button
-                        className="ai-edit-action accept"
-                        onClick={(e) => handleAccept(e, edit.elementId)}
-                        title="Accept edit"
-                      >
-                        <Check size={14} />
-                        <span>Accept</span>
-                      </button>
-                      <button
-                        className="ai-edit-action reject"
-                        onClick={(e) => handleReject(e, edit.elementId)}
-                        title="Reject edit"
-                      >
-                        <X size={14} />
-                        <span>Reject</span>
-                      </button>
-                    </div>
-                  </button>
+                    <ChevronRight size={15} className="ai-edit-summary-jump" aria-hidden="true" />
+                  </div>
                 ))}
               </div>
             )}
@@ -1436,9 +1615,20 @@ export default function AIChat({
           <textarea
             ref={inputRef}
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onChange={(event) => {
+              setInput(event.target.value);
+              resizeInput(event.currentTarget);
+            }}
             onKeyDown={handleKeyDown}
-            placeholder={mode === 'edit' ? 'Request edits to your screenplay...' : 'Ask about your screenplay...'}
+            placeholder={
+              mode === 'edit'
+                ? 'Request edits to your screenplay...'
+                : mode === 'outline'
+                  ? 'Develop your outline...'
+                  : mode === 'storyboard'
+                    ? 'Describe the shot list you want...'
+                  : 'Ask about your screenplay...'
+            }
             rows={1}
             disabled={isStreaming}
           />
@@ -1447,6 +1637,7 @@ export default function AIChat({
               className="ai-send-btn ai-stop-btn"
               onClick={stopStreaming}
               title="Stop generating"
+              aria-label="Stop generating"
             >
               <Square size={16} />
             </button>
@@ -1456,6 +1647,7 @@ export default function AIChat({
               onClick={handleSend}
               disabled={!input.trim()}
               title="Send message"
+              aria-label="Send message"
             >
               <Send size={16} />
             </button>

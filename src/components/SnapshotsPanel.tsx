@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Screenplay, ScriptSnapshot } from '../types';
 import { Clock, Plus, RotateCcw, Trash2, Edit2, Check, X, History, Archive } from 'lucide-react';
+import Dialog from './Dialog';
 
 interface SnapshotsPanelProps {
   screenplay: Screenplay;
@@ -81,15 +82,18 @@ export default function SnapshotsPanel({
   };
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal-content snapshots-modal" onClick={e => e.stopPropagation()}>
+    <Dialog
+      className="modal-content snapshots-modal"
+      ariaLabelledBy="snapshots-title"
+      onClose={onClose}
+    >
         <div className="modal-header">
           <div className="snapshots-header-title">
             <History size={20} />
-            <h2>Script Snapshots</h2>
+            <h2 id="snapshots-title">Script Snapshots</h2>
             <span className="snapshot-count-badge">{snapshots.length}</span>
           </div>
-          <button className="modal-close" onClick={onClose}>
+          <button className="modal-close" onClick={onClose} aria-label="Close snapshots">
             <X size={20} />
           </button>
         </div>
@@ -223,8 +227,7 @@ export default function SnapshotsPanel({
         <div className="modal-footer">
           <span>Snapshots are stored locally • Maximum 20 snapshots</span>
         </div>
-      </div>
-    </div>
+    </Dialog>
   );
 }
 

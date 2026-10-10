@@ -71,6 +71,14 @@ export default function CharacterTracker({
                     className="timeline-scene-header"
                     title={scene.heading}
                     onClick={() => handleCellClick(scene.id)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        handleCellClick(scene.id);
+                      }
+                    }}
+                    role="button"
+                    tabIndex={0}
                     style={{ cursor: 'pointer' }}
                   >
                     {idx + 1}
@@ -113,6 +121,14 @@ export default function CharacterTracker({
                             : 'transparent',
                         } as React.CSSProperties}
                         onClick={() => presence && handleCellClick(scene.id)}
+                        onKeyDown={presence ? (event) => {
+                          if (event.key === 'Enter' || event.key === ' ') {
+                            event.preventDefault();
+                            handleCellClick(scene.id);
+                          }
+                        } : undefined}
+                        role={presence ? 'button' : undefined}
+                        tabIndex={presence ? 0 : undefined}
                         title={presence 
                           ? `${character.name}: ${presence.dialogueCount} dialogue${presence.dialogueCount !== 1 ? 's' : ''}${presence.isFirstAppearance ? ' (First Appearance)' : ''}`
                           : `${character.name} not in this scene`

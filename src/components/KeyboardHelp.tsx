@@ -1,3 +1,5 @@
+import Dialog from './Dialog';
+
 interface KeyboardHelpProps {
   isOpen: boolean;
   onClose: () => void;
@@ -6,7 +8,12 @@ interface KeyboardHelpProps {
 const shortcuts = [
   { keys: ['⌘/Ctrl', 'Z'], description: 'Undo' },
   { keys: ['⌘/Ctrl', 'Shift', 'Z'], description: 'Redo' },
+  { keys: ['⌘/Ctrl', 'N'], description: 'New screenplay' },
   { keys: ['⌘/Ctrl', 'F'], description: 'Find & Replace' },
+  { keys: ['⌘/Ctrl', 'Shift', 'F'], description: 'Toggle Line Focus' },
+  { keys: ['⌘/Ctrl', 'Shift', 'T'], description: 'Toggle Typewriter Mode' },
+  { keys: ['⌘/Ctrl', '/'], description: 'Toggle AI chat' },
+  { keys: ['F1'], description: 'Open keyboard help' },
   { keys: ['F11'], description: 'Toggle distraction-free mode' },
   { keys: ['Tab'], description: 'Cycle element type (Action → Character → Dialogue → Parenthetical)' },
   { keys: ['Enter'], description: 'Create new element below' },
@@ -25,11 +32,10 @@ export default function KeyboardHelp({ isOpen, onClose }: KeyboardHelpProps) {
   if (!isOpen) return null;
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+    <Dialog ariaLabelledBy="keyboard-help-title" onClose={onClose}>
         <div className="modal-header">
-          <h2>Keyboard Shortcuts</h2>
-          <button className="modal-close" onClick={onClose}>×</button>
+          <h2 id="keyboard-help-title">Keyboard Shortcuts</h2>
+          <button className="modal-close" onClick={onClose} aria-label="Close keyboard shortcuts">×</button>
         </div>
         
         <div className="modal-body">
@@ -96,10 +102,9 @@ export default function KeyboardHelp({ isOpen, onClose }: KeyboardHelpProps) {
         </div>
         
         <div className="modal-footer">
-          <p>Press <kbd>?</kbd> to toggle this help</p>
+          <p>Press <kbd>F1</kbd> to toggle this help</p>
         </div>
-      </div>
-    </div>
+    </Dialog>
   );
 }
 

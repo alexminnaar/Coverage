@@ -1,4 +1,5 @@
 import type { ScriptElement } from '../types';
+import { getPageCount } from './pageBreaks';
 
 export interface GlobalIndexOptions {
   maxScenes?: number;
@@ -26,6 +27,7 @@ export function buildGlobalIndex(
   const maxScenes = opts.maxScenes ?? 60;
   const maxCharacters = opts.maxCharacters ?? 20;
   const maxChars = opts.maxChars ?? 2800;
+  const totalScenes = elements.filter(el => el.type === 'scene-heading').length;
 
   const sceneLines: string[] = [];
   let sceneNo = 0;
@@ -65,6 +67,11 @@ export function buildGlobalIndex(
 
   const lines: string[] = [];
   lines.push('Global Index v1');
+  lines.push('');
+  lines.push('Screenplay:');
+  lines.push(`- Script pages: ${getPageCount(elements)} (title page excluded)`);
+  lines.push(`- Scenes: ${totalScenes}`);
+  lines.push(`- Elements: ${elements.length}`);
   lines.push('');
   lines.push('Scenes:');
   lines.push(...(sceneLines.length ? sceneLines : ['(none)']));

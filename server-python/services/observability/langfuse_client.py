@@ -131,8 +131,8 @@ class LangfuseClient:
         try:
             trace = self._client.trace(
                 name=name,
-                input=input_prompt,
-                output=output_text,
+                input=input_prompt if self.log_content else None,
+                output=output_text if self.log_content else None,
                 metadata=metadata,
                 tags=tags,
             )
@@ -165,7 +165,7 @@ class LangfuseClient:
                     self._client.span(
                         trace_id=trace_id,
                         name=f"tool:{tool_name}",
-                        input=self._safe_serialize(args),
+                        input=self._safe_serialize(args) if self.log_content else None,
                         metadata={"step": step, "tool_call_id": tool_call_id},
                     )
 
@@ -178,7 +178,7 @@ class LangfuseClient:
                     self._client.span(
                         trace_id=trace_id,
                         name=f"tool-result:{tool_name}",
-                        output=self._safe_serialize(output, max_len=4000),
+                        output=self._safe_serialize(output, max_len=4000) if self.log_content else None,
                         metadata={"step": step_num, "tool_call_id": tool_call_id},
                     )
 
@@ -193,7 +193,7 @@ class LangfuseClient:
                     self._client.generation(
                         trace_id=trace_id,
                         name="model-response",
-                        output=content[:4000] if content else None,
+                        output=content[:4000] if self.log_content and content else None,
                         metadata={"step": step},
                     )
 

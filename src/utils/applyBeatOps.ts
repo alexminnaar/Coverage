@@ -16,7 +16,8 @@ export type BeatOp =
       reason?: string;
     }
   | { op: 'delete'; id: string; reason?: string }
-  | { op: 'move'; id: string; targetActIndex: number; targetOrder: number; reason?: string };
+  | { op: 'move'; id: string; targetActIndex: number; targetOrder: number; reason?: string }
+  | { op: 'set_treatment'; treatment: string; reason?: string };
 
 const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(max, n));
 

@@ -1,5 +1,6 @@
 import { useMemo } from 'react';
 import { ScriptElement } from '../types';
+import Dialog from './Dialog';
 
 interface StatisticsProps {
   isOpen: boolean;
@@ -82,11 +83,14 @@ export default function Statistics({
   if (!isOpen) return null;
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal-content statistics-modal" onClick={(e) => e.stopPropagation()}>
+    <Dialog
+      className="modal-content statistics-modal"
+      ariaLabelledBy="statistics-title"
+      onClose={onClose}
+    >
         <div className="modal-header">
-          <h2>Statistics</h2>
-          <button className="modal-close" onClick={onClose}>×</button>
+          <h2 id="statistics-title">Statistics</h2>
+          <button className="modal-close" onClick={onClose} aria-label="Close statistics">×</button>
         </div>
         
         <div className="modal-body">
@@ -173,8 +177,7 @@ export default function Statistics({
             <p>Average scene length: ~{stats.avgSceneLength} words</p>
           </div>
         </div>
-      </div>
-    </div>
+    </Dialog>
   );
 }
 

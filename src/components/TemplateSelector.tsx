@@ -3,6 +3,7 @@ import { X, BookOpen, Check } from 'lucide-react';
 import { STORY_TEMPLATES, StoryTemplate } from '../data/storyTemplates';
 import { Beat } from '../types';
 import { v4 as uuidv4 } from 'uuid';
+import Dialog from './Dialog';
 
 interface TemplateSelectorProps {
   isOpen: boolean;
@@ -39,17 +40,17 @@ export default function TemplateSelector({
   if (!isOpen) return null;
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div 
-        className="modal template-selector-modal" 
-        onClick={e => e.stopPropagation()}
-      >
+    <Dialog
+      className="modal template-selector-modal"
+      ariaLabelledBy="template-selector-title"
+      onClose={onClose}
+    >
         <div className="modal-header">
-          <h2>
+          <h2 id="template-selector-title">
             <BookOpen size={20} />
             Story Structure Templates
           </h2>
-          <button className="modal-close" onClick={onClose}>
+          <button className="modal-close" onClick={onClose} aria-label="Close story templates">
             <X size={20} />
           </button>
         </div>
@@ -62,6 +63,15 @@ export default function TemplateSelector({
                 key={template.id}
                 className={`template-card ${selectedTemplate?.id === template.id ? 'selected' : ''}`}
                 onClick={() => setSelectedTemplate(template)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    setSelectedTemplate(template);
+                  }
+                }}
+                role="button"
+                tabIndex={0}
+                aria-pressed={selectedTemplate?.id === template.id}
               >
                 {selectedTemplate?.id === template.id && (
                   <div className="template-check">
@@ -111,8 +121,7 @@ export default function TemplateSelector({
             Apply to Beat Board
           </button>
         </div>
-      </div>
-    </div>
+    </Dialog>
   );
 }
 

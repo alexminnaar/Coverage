@@ -92,13 +92,33 @@ export function getCharacterWithContd(
  */
 export function processContdMarkers(elements: ScriptElement[]): Map<string, boolean> {
   const markers = new Map<string, boolean>();
-  
-  elements.forEach((el, index) => {
-    if (el.type === 'character') {
-      markers.set(el.id, shouldShowContd(elements, index));
+
+  let previousCharacter: string | null = null;
+  let interrupted = false;
+
+  for (const element of elements) {
+    if (element.type === 'scene-heading') {
+      previousCharacter = null;
+      interrupted = false;
+      continue;
     }
-  });
-  
+
+    if (element.type === 'action' || element.type === 'transition') {
+      if (previousCharacter) interrupted = true;
+      continue;
+    }
+
+    if (element.type === 'character') {
+      const currentCharacter = normalizeCharacterName(element.content);
+      markers.set(
+        element.id,
+        Boolean(currentCharacter && previousCharacter === currentCharacter && interrupted),
+      );
+      previousCharacter = currentCharacter || null;
+      interrupted = false;
+    }
+  }
+
   return markers;
 }
 

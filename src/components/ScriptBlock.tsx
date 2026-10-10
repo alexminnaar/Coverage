@@ -1,14 +1,14 @@
-import { useRef, useEffect, useState, useMemo, KeyboardEvent, ChangeEvent } from 'react';
+import { memo, useRef, useEffect, useState, KeyboardEvent, ChangeEvent } from 'react';
 import { ScriptElement, ElementType, ELEMENT_LABELS, getNextElementType } from '../types';
 import { useCharacterSuggestion } from '../hooks/useCharacterSuggestion';
-import { shouldShowContd } from '../utils/contdMore';
 
 import { PendingEdit } from '../types';
-import { Check, X } from 'lucide-react';
 
 interface ScriptBlockProps {
   element: ScriptElement;
-  allElements: ScriptElement[];
+  characters: string[];
+  locations: string[];
+  showContd: boolean;
   isFirst: boolean;
   registerRef: (id: string, ref: HTMLElement | null) => void;
   onContentChange: (content: string) => void;
@@ -18,17 +18,17 @@ interface ScriptBlockProps {
   onFocusPrevious: () => void;
   onFocusNext: () => void;
   onStartDualDialogue?: (characterId: string) => void;
-  autoContd?: boolean;
   onFocus?: () => void;
   isDimmed?: boolean;
   pendingEdit?: PendingEdit;
-  onAcceptEdit?: () => void;
-  onRejectEdit?: () => void;
+  isReviewFocused?: boolean;
 }
 
-export default function ScriptBlock({
+function ScriptBlock({
   element,
-  allElements,
+  characters,
+  locations,
+  showContd,
   isFirst,
   registerRef,
   onContentChange,
@@ -38,23 +38,14 @@ export default function ScriptBlock({
   onFocusPrevious,
   onFocusNext,
   onStartDualDialogue,
-  autoContd = true,
   onFocus,
   isDimmed = false,
   pendingEdit,
-  onAcceptEdit,
-  onRejectEdit,
+  isReviewFocused = false,
 }: ScriptBlockProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const pendingEditRef = useRef<HTMLDivElement>(null);
   const [isFocused, setIsFocused] = useState(false);
-
-  // Calculate if this character element should show (CONT'D)
-  const showContd = useMemo(() => {
-    if (!autoContd || element.type !== 'character') return false;
-    const index = allElements.findIndex(el => el.id === element.id);
-    return index >= 0 && shouldShowContd(allElements, index);
-  }, [autoContd, element.type, element.id, allElements]);
 
   // Character/location suggestion hook
   const {
@@ -62,7 +53,8 @@ export default function ScriptBlock({
     acceptSuggestion,
     dismissSuggestion,
   } = useCharacterSuggestion({
-    elements: allElements,
+    characters,
+    locations,
     currentContent: element.content,
     currentType: element.type,
     isActive: isFocused && (element.type === 'character' || element.type === 'scene-heading'),
@@ -83,7 +75,7 @@ export default function ScriptBlock({
       // Reset height computation
       textarea.style.height = '0px';
       // Force reflow
-      textarea.offsetHeight;
+      void textarea.offsetHeight;
       // Set to scroll height
       const newHeight = textarea.scrollHeight + 'px';
       textarea.style.height = newHeight;
@@ -97,7 +89,7 @@ export default function ScriptBlock({
       // Reset height computation
       textarea.style.height = '0px';
       // Force reflow
-      textarea.offsetHeight;
+      void textarea.offsetHeight;
       // Set to scroll height
       const newHeight = textarea.scrollHeight + 'px';
       textarea.style.height = newHeight;
@@ -105,7 +97,7 @@ export default function ScriptBlock({
   }, [isFocused, element.id, element.type]);
 
   const handleChange = (e: ChangeEvent<HTMLTextAreaElement>) => {
-    let content = e.target.value;
+    const content = e.target.value;
 
     // Auto-detect scene headings
     if (element.type !== 'scene-heading') {
@@ -311,7 +303,11 @@ export default function ScriptBlock({
 
     if (isInsertOnly) {
     return (
-      <div className="pending-insert-wrapper" ref={pendingEditRef}>
+      <div
+        className={`pending-insert-wrapper ${isReviewFocused ? 'is-review-focused' : ''}`}
+        ref={pendingEditRef}
+        tabIndex={-1}
+      >
           {/* Unchanged block rendered normally (outside preview container) */}
           {renderStandardBlock()}
 
@@ -336,22 +332,6 @@ export default function ScriptBlock({
               </div>
             )}
 
-            <div className="pending-edit-actions">
-              <button
-                className="edit-action-btn accept"
-                onClick={(e) => { e.stopPropagation(); onAcceptEdit?.(); }}
-                title="Accept Change"
-              >
-                <Check size={16} />
-              </button>
-              <button
-                className="edit-action-btn reject"
-                onClick={(e) => { e.stopPropagation(); onRejectEdit?.(); }}
-                title="Reject Change"
-              >
-                <X size={16} />
-              </button>
-            </div>
           </div>
         </div>
       );
@@ -359,8 +339,9 @@ export default function ScriptBlock({
 
     return (
       <div
-        className={`script-block script-block--${element.type} pending-edit-container`}
+        className={`script-block script-block--${element.type} pending-edit-container ${isReviewFocused ? 'is-review-focused' : ''}`}
         ref={pendingEditRef}
+        tabIndex={-1}
       >
         <div className="pending-edit-comparison">
           {/* Original Content (Red) - only show if content is changing */}
@@ -407,27 +388,21 @@ export default function ScriptBlock({
           </div>
         )}
 
-        {/* Action Buttons */}
-        <div className="pending-edit-actions">
-          <button
-            className="edit-action-btn accept"
-            onClick={(e) => { e.stopPropagation(); onAcceptEdit?.(); }}
-            title="Accept Change"
-          >
-            <Check size={16} />
-          </button>
-          <button
-            className="edit-action-btn reject"
-            onClick={(e) => { e.stopPropagation(); onRejectEdit?.(); }}
-            title="Reject Change"
-          >
-            <X size={16} />
-          </button>
-        </div>
       </div>
     );
   }
 
   return renderStandardBlock();
 }
+
+export default memo(ScriptBlock, (previous, next) => (
+  previous.element === next.element &&
+  previous.characters === next.characters &&
+  previous.locations === next.locations &&
+  previous.showContd === next.showContd &&
+  previous.isFirst === next.isFirst &&
+  previous.isDimmed === next.isDimmed &&
+  previous.pendingEdit === next.pendingEdit &&
+  previous.isReviewFocused === next.isReviewFocused
+));
 

@@ -275,7 +275,16 @@ export default function SceneCompare({
                     <div
                       key={snapshot.id}
                       className={`scene-compare-snapshot-item ${isSelected ? 'selected' : ''}`}
-                      onClick={() => !isEditing && setSelectedSnapshotId(snapshot.id)}
+                      onClick={isEditing ? undefined : () => setSelectedSnapshotId(snapshot.id)}
+                      onKeyDown={isEditing ? undefined : (event) => {
+                        if (event.key === 'Enter' || event.key === ' ') {
+                          event.preventDefault();
+                          setSelectedSnapshotId(snapshot.id);
+                        }
+                      }}
+                      role={isEditing ? undefined : 'button'}
+                      tabIndex={isEditing ? undefined : 0}
+                      aria-pressed={isEditing ? undefined : isSelected}
                     >
                       {isEditing ? (
                         <div className="scene-compare-snapshot-edit">
@@ -383,7 +392,15 @@ export default function SceneCompare({
                         <div
                           key={id}
                           className={`scene-compare-scene-item scene-compare-scene-${status} ${canNavigate ? 'clickable' : ''}`}
-                          onClick={() => canNavigate && handleSceneClick(id)}
+                          onClick={canNavigate ? () => handleSceneClick(id) : undefined}
+                          onKeyDown={canNavigate ? (event) => {
+                            if (event.key === 'Enter' || event.key === ' ') {
+                              event.preventDefault();
+                              handleSceneClick(id);
+                            }
+                          } : undefined}
+                          role={canNavigate ? 'button' : undefined}
+                          tabIndex={canNavigate ? 0 : undefined}
                           style={{ cursor: canNavigate ? 'pointer' : 'default' }}
                         >
                           <div className="scene-compare-scene-number">

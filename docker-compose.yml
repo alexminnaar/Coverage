@@ -35,6 +35,15 @@ services:
       DB_PASSWORD: ${DB_PASSWORD:-screenwriter}
     ports:
       - "3001:3001"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://localhost:3001/api/health').then(r=>r.json()).then(h=>process.exit(h.database_connected ? 0 : 1)).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 5
     depends_on:
       postgres:
         condition: service_healthy
@@ -54,6 +63,12 @@ services:
     environment:
       PORT: 3002
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_IMAGE_MODEL: ${OPENAI_IMAGE_MODEL:-gpt-image-2}
+      R2_ENDPOINT_URL: ${R2_ENDPOINT_URL:-}
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
+      R2_BUCKET_NAME: ${R2_BUCKET_NAME:-}
+      R2_PUBLIC_BASE_URL: ${R2_PUBLIC_BASE_URL:-}
       # Langfuse Cloud (observability)
       LANGFUSE_ENABLED: ${LANGFUSE_ENABLED:-true}
       LANGFUSE_HOST: ${LANGFUSE_HOST:-https://cloud.langfuse.com}
@@ -68,6 +83,15 @@ services:
       DB_PASSWORD: ${DB_PASSWORD:-screenwriter}
     ports:
       - "3002:3002"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json,urllib.request,sys; h=json.load(urllib.request.urlopen('http://localhost:3002/api/health')); sys.exit(0 if h.get('configured') and h.get('database_connected') else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
     depends_on:
       postgres:
         condition: service_healthy
@@ -81,12 +105,13 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: screenwriter-frontend
-    environment:
-      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://backend:3001/api}
     ports:
       - "5173:80"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
+      ai-service:
+        condition: service_healthy
     networks:
       - screenwriter-network
 

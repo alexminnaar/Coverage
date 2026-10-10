@@ -9,32 +9,36 @@ import {
   ArrowLeftRight,
   Keyboard,
   BookOpen,
-  Sparkles,
+  FileText,
 } from 'lucide-react';
 import { Beat, BeatStructure, BEAT_STRUCTURES, ScriptElement } from '../types';
-import { applyBeatOps as applyBeatOpsToBeats, BeatOp } from '../utils/applyBeatOps';
 import BeatColumn from './BeatColumn';
 import TemplateSelector from './TemplateSelector';
-import BeatAIPanel from './BeatAIPanel';
 
 interface BeatBoardProps {
-  projectId?: string;
   beats: Beat[];
   beatStructure: BeatStructure;
   elements: ScriptElement[];
+  treatment: string;
   onBeatsChange: (beats: Beat[]) => void;
+  onTreatmentChange: (treatment: string) => void;
   onStructureChange: (structure: BeatStructure) => void;
+  activeView: 'board' | 'treatment';
+  onViewChange: (view: 'board' | 'treatment') => void;
   selectedBeatId?: string | null;
   onClose: () => void;
 }
 
 export default function BeatBoard({
-  projectId,
   beats,
   beatStructure,
   elements,
+  treatment,
   onBeatsChange,
+  onTreatmentChange,
   onStructureChange,
+  activeView,
+  onViewChange,
   selectedBeatId: externalSelectedBeatId = null,
   onClose,
 }: BeatBoardProps) {
@@ -42,7 +46,7 @@ export default function BeatBoard({
   const [draggedBeatId, setDraggedBeatId] = useState<string | null>(null);
   const [showStructureMenu, setShowStructureMenu] = useState(false);
   const [showTemplateSelector, setShowTemplateSelector] = useState(false);
-  const [showAIPanel, setShowAIPanel] = useState(false);
+  const [density, setDensity] = useState<'compact' | 'comfortable'>('compact');
 
   useEffect(() => {
     setSelectedBeatId(externalSelectedBeatId);
@@ -90,6 +94,24 @@ export default function BeatBoard({
     }
     return grouped;
   }, [beats, actNames]);
+
+  const linkedBeatCount = useMemo(
+    () => beats.filter((beat) => beat.linkedSceneId).length,
+    [beats]
+  );
+  const treatmentWordCount = useMemo(
+    () => treatment.trim() ? treatment.trim().split(/\s+/).length : 0,
+    [treatment]
+  );
+
+  const beatOffsets = useMemo(() => {
+    let offset = 0;
+    return beatsByAct.map((actBeats) => {
+      const currentOffset = offset;
+      offset += actBeats.length;
+      return currentOffset;
+    });
+  }, [beatsByAct]);
 
   const handleAddBeat = useCallback(
     (actIndex: number) => {
@@ -166,58 +188,19 @@ export default function BeatBoard({
     [beats, onBeatsChange]
   );
 
-  const applyBeatOps = useCallback(
-    (ops: BeatOp[]) => {
-      const nextBeats = applyBeatOpsToBeats(beats, ops, actNames.length, (deletedId) => {
-        if (selectedBeatId === deletedId) {
-          setSelectedBeatId(null);
-        }
-      });
-      onBeatsChange(nextBeats);
-    },
-    [beats, onBeatsChange, actNames.length, selectedBeatId]
-  );
-
   const handleStructureChange = (structure: BeatStructure) => {
     onStructureChange(structure);
     setShowStructureMenu(false);
   };
 
-  const handleAddBeatWithSeed = useCallback(
-    (actIndex: number, insertAfterOrder?: number, seed?: Partial<Beat>) => {
-      const actBeats = beats
-        .filter((b) => b.actIndex === actIndex)
-        .sort((a, b) => a.order - b.order);
-
-      const targetIndex =
-        insertAfterOrder !== undefined
-          ? Math.min(Math.max(insertAfterOrder + 1, 0), actBeats.length)
-          : actBeats.length;
-
-      const newBeat: Beat = {
-        id: uuidv4(),
-        title: seed?.title ?? '',
-        description: seed?.description ?? '',
-        actIndex,
-        order: targetIndex,
-        linkedSceneId: seed?.linkedSceneId,
-        color: seed?.color,
-      };
-
-      const nextBeats = [...actBeats];
-      nextBeats.splice(targetIndex, 0, newBeat);
-      const renumbered = nextBeats.map((b, i) => ({ ...b, order: i }));
-      const other = beats.filter((b) => b.actIndex !== actIndex);
-      onBeatsChange([...other, ...renumbered]);
-      setSelectedBeatId(newBeat.id);
-    },
-    [beats, onBeatsChange]
-  );
-
   const handleKeyDown = useCallback(
-    (e: React.KeyboardEvent) => {
+    (e: KeyboardEvent) => {
+      if (e.target instanceof Element && e.target.closest('.ai-chat')) return;
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+
       if (e.key === 'Escape') {
         onClose();
+        e.stopPropagation();
         return;
       }
 
@@ -254,29 +237,48 @@ export default function BeatBoard({
     [selectedBeatId, beats, actNames, handleMoveBeat, handleDeleteBeat, onClose]
   );
 
+  useEffect(() => {
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [handleKeyDown]);
+
   return (
-    <div className="beat-board" onKeyDown={handleKeyDown} tabIndex={0}>
+    <div className={`beat-board density-${density}`} tabIndex={-1}>
       <div className="beat-board-header">
-        <button className="beat-back-btn" onClick={onClose}>
-          <ArrowLeft size={18} />
-          <span>Back to Script</span>
-        </button>
-        
-        <div className="beat-board-title">
-          <LayoutGrid size={20} />
-          <h2>Beat Board</h2>
-          <span className="beat-total-badge">{beats.length} beats</span>
+        <div className="beat-board-heading">
+          <button className="beat-back-btn" onClick={onClose}>
+            <ArrowLeft size={17} />
+            <span>Back to script</span>
+          </button>
+          <span className="beat-heading-divider" aria-hidden="true" />
+          <div className="beat-board-title">
+            <span className="beat-title-icon"><LayoutGrid size={17} /></span>
+            <div>
+              <span className="beat-board-kicker">Story structure</span>
+              <h2>Beat Board</h2>
+            </div>
+          </div>
         </div>
         
         <div className="beat-board-actions">
-          <button
-            className={`beat-ai-btn ${showAIPanel ? 'active' : ''}`}
-            onClick={() => setShowAIPanel((prev) => !prev)}
-            title="Open Beat AI"
-          >
-            <Sparkles size={16} />
-            <span>Beat AI</span>
-          </button>
+          <div className="beat-density-toggle" role="group" aria-label="Beat card density">
+            <button
+              type="button"
+              className={density === 'compact' ? 'active' : ''}
+              onClick={() => setDensity('compact')}
+              aria-pressed={density === 'compact'}
+            >
+              Compact
+            </button>
+            <button
+              type="button"
+              className={density === 'comfortable' ? 'active' : ''}
+              onClick={() => setDensity('comfortable')}
+              aria-pressed={density === 'comfortable'}
+            >
+              Expanded
+            </button>
+          </div>
           <button 
             className="template-btn"
             onClick={() => setShowTemplateSelector(true)}
@@ -310,42 +312,130 @@ export default function BeatBoard({
         </div>
       </div>
 
-      <div className="beat-board-content">
-        <div className="beat-columns">
-          {actNames.map((actName, actIndex) => (
-            <BeatColumn
-              key={actIndex}
-              title={actName}
-              actIndex={actIndex}
-              beats={beatsByAct[actIndex]}
-              selectedBeatId={selectedBeatId}
-              onSelectBeat={setSelectedBeatId}
-              onUpdateBeat={handleUpdateBeat}
-              onDeleteBeat={handleDeleteBeat}
-              onAddBeat={() => handleAddBeat(actIndex)}
-              onMoveBeat={handleMoveBeat}
-              getLinkedSceneName={getLinkedSceneName}
-              draggedBeatId={draggedBeatId}
-              setDraggedBeatId={setDraggedBeatId}
-            />
-          ))}
+      <div className="beat-board-overview">
+        <div className="beat-overview-label">
+          <span>Story map</span>
+          <strong>{beats.length} beats</strong>
         </div>
+        <div className="beat-distribution" aria-label="Beat distribution across acts">
+          {actNames.map((actName, actIndex) => {
+            const count = beatsByAct[actIndex].length;
+            const percentage = beats.length ? Math.round((count / beats.length) * 100) : 0;
+            return (
+              <div
+                className={`beat-distribution-segment act-${actIndex + 1}`}
+                key={actName}
+                style={{ flexGrow: Math.max(count, 1) }}
+                title={`${actName}: ${count} beats (${percentage}%)`}
+              >
+                <span>{actName}</span>
+                <strong>{percentage}%</strong>
+              </div>
+            );
+          })}
+        </div>
+        <span className="beat-linked-summary">
+          {linkedBeatCount} of {beats.length} linked to scenes
+        </span>
       </div>
+
+      <div className="beat-workspace-tabs" role="tablist" aria-label="Outline views">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeView === 'board'}
+          className={activeView === 'board' ? 'active' : ''}
+          onClick={() => onViewChange('board')}
+        >
+          <LayoutGrid size={14} />
+          Board
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeView === 'treatment'}
+          className={activeView === 'treatment' ? 'active' : ''}
+          onClick={() => onViewChange('treatment')}
+        >
+          <FileText size={14} />
+          Treatment
+          {treatmentWordCount > 0 && <span>{treatmentWordCount}</span>}
+        </button>
+      </div>
+
+      {activeView === 'board' ? (
+        <div className="beat-board-content" role="tabpanel">
+          <div className="beat-columns">
+            {actNames.map((actName, actIndex) => (
+              <BeatColumn
+                key={actIndex}
+                title={actName}
+                actIndex={actIndex}
+                beats={beatsByAct[actIndex]}
+                totalBeats={beats.length}
+                beatNumberOffset={beatOffsets[actIndex]}
+                selectedBeatId={selectedBeatId}
+                onSelectBeat={setSelectedBeatId}
+                onUpdateBeat={handleUpdateBeat}
+                onDeleteBeat={handleDeleteBeat}
+                onAddBeat={() => handleAddBeat(actIndex)}
+                onMoveBeat={handleMoveBeat}
+                getLinkedSceneName={getLinkedSceneName}
+                draggedBeatId={draggedBeatId}
+                setDraggedBeatId={setDraggedBeatId}
+              />
+            ))}
+          </div>
+        </div>
+      ) : (
+        <div className="treatment-workspace" role="tabpanel">
+          <div className="treatment-editor-shell">
+            <header>
+              <div>
+                <span className="treatment-kicker">Story document</span>
+                <h3>Treatment</h3>
+              </div>
+              <div className="treatment-meta">
+                <strong>{treatmentWordCount.toLocaleString()}</strong>
+                <span>{treatmentWordCount === 1 ? 'word' : 'words'}</span>
+              </div>
+            </header>
+            <p className="treatment-guidance">
+              Tell the complete story in prose: characters, major turns, ending, and emotional arc.
+            </p>
+            <textarea
+              value={treatment}
+              onChange={(event) => onTreatmentChange(event.target.value)}
+              placeholder="Write the treatment here, or ask Coverage in Outline mode to draft one from your beats and screenplay…"
+              aria-label="Screenplay treatment"
+              spellCheck
+            />
+            <footer>
+              <span>Saved with this screenplay</span>
+              <span>Outline AI can read and propose changes to this treatment</span>
+            </footer>
+          </div>
+        </div>
+      )}
 
       <div className="beat-board-footer">
         <div className="beat-board-hints">
-          <div className="hint-item">
-            <ArrowUpDown size={12} />
-            <span>Reorder</span>
-          </div>
-          <div className="hint-item">
-            <ArrowLeftRight size={12} />
-            <span>Move acts</span>
-          </div>
-          <div className="hint-item">
-            <Grip size={12} />
-            <span>Drag & drop</span>
-          </div>
+          {activeView === 'board' && (
+            <>
+              <div className="hint-item">
+                <ArrowUpDown size={12} />
+                <span>Reorder</span>
+              </div>
+              <div className="hint-item">
+                <ArrowLeftRight size={12} />
+                <span>Move acts</span>
+              </div>
+              <div className="hint-item">
+                <Grip size={12} />
+                <span>Drag & drop</span>
+              </div>
+            </>
+          )}
           <div className="hint-item">
             <Keyboard size={12} />
             <span>Esc to close</span>
@@ -358,22 +448,6 @@ export default function BeatBoard({
         isOpen={showTemplateSelector}
         onClose={() => setShowTemplateSelector(false)}
         onApplyTemplate={handleApplyTemplate}
-      />
-      <BeatAIPanel
-        isOpen={showAIPanel}
-        onClose={() => setShowAIPanel(false)}
-        beats={beats}
-        elements={elements}
-        projectId={projectId}
-        groundToScreenplay={false}
-        actNames={actNames}
-        scenes={scenes}
-        selectedBeatId={selectedBeatId}
-        onUpdateBeat={handleUpdateBeat}
-        onAddBeat={handleAddBeatWithSeed}
-        onDeleteBeat={handleDeleteBeat}
-        onMoveBeat={handleMoveBeat}
-        onApplyOps={applyBeatOps}
       />
     </div>
   );

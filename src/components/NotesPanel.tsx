@@ -166,6 +166,14 @@ export default function NotesPanel({
                 <span 
                   className="note-element-ref"
                   onClick={() => onJumpToElement(note.elementId)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault();
+                      onJumpToElement(note.elementId);
+                    }
+                  }}
+                  role="button"
+                  tabIndex={0}
                   style={{ cursor: 'pointer' }}
                 >
                   {getElementInfo(note.elementId)}

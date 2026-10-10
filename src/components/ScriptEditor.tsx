@@ -3,8 +3,21 @@ import { ScriptElement, ElementType } from '../types';
 import ScriptBlock from './ScriptBlock';
 import { groupDualDialogue, ElementGroup } from '../utils/dualDialogue';
 import { useTypewriterScroll } from '../hooks/useTypewriterScroll';
+import { getCharacterNames, extractLocations } from '../utils/characterUtils';
+import { processContdMarkers } from '../utils/contdMore';
 
 import { PendingEdit } from '../types';
+
+function useStableStringArray(values: string[]): string[] {
+  const stableRef = useRef(values);
+  const previous = stableRef.current;
+  const unchanged =
+    previous.length === values.length &&
+    previous.every((value, index) => value === values[index]);
+
+  if (!unchanged) stableRef.current = values;
+  return stableRef.current;
+}
 
 interface ScriptEditorProps {
   elements: ScriptElement[];
@@ -21,8 +34,7 @@ interface ScriptEditorProps {
   focusMode?: boolean;
   // Inline AI Edits
   pendingEdits?: Map<string, PendingEdit>;
-  onAcceptEdit?: (id: string) => void;
-  onRejectEdit?: (id: string) => void;
+  reviewElementId?: string | null;
   // Callback when active element changes (for notes panel)
   onActiveElementChange?: (elementId: string | null) => void;
 }
@@ -41,8 +53,7 @@ export default function ScriptEditor({
   typewriterMode = false,
   focusMode = false,
   pendingEdits,
-  onAcceptEdit,
-  onRejectEdit,
+  reviewElementId,
   onActiveElementChange,
 }: ScriptEditorProps) {
   const editorRef = useRef<HTMLDivElement>(null);
@@ -58,6 +69,17 @@ export default function ScriptEditor({
 
   // Group elements for dual dialogue rendering
   const elementGroups = useMemo(() => groupDualDialogue(elements), [elements]);
+  const elementIndexById = useMemo(
+    () => new Map(elements.map((element, index) => [element.id, index])),
+    [elements],
+  );
+  const contdMarkers = useMemo(() => processContdMarkers(elements), [elements]);
+  const characters = useStableStringArray(
+    useMemo(() => getCharacterNames(elements), [elements]),
+  );
+  const locations = useStableStringArray(
+    useMemo(() => extractLocations(elements), [elements]),
+  );
 
   // Track active element for typewriter mode
   const handleElementFocus = useCallback((id: string) => {
@@ -88,13 +110,13 @@ export default function ScriptEditor({
     }
   }, [focusedElementId, onFocusConsumed]);
 
-  const registerRef = (id: string, ref: HTMLElement | null) => {
+  const registerRef = useCallback((id: string, ref: HTMLElement | null) => {
     if (ref) {
       blockRefs.current.set(id, ref);
     } else {
       blockRefs.current.delete(id);
     }
-  };
+  }, []);
 
   // Navigate to previous/next block
   const focusPrevious = (currentId: string) => {
@@ -128,7 +150,9 @@ export default function ScriptEditor({
     <ScriptBlock
       key={element.id}
       element={element}
-      allElements={elements}
+      characters={characters}
+      locations={locations}
+      showContd={autoContd && Boolean(contdMarkers.get(element.id))}
       isFirst={index === 0}
       registerRef={registerRef}
       onContentChange={(content) => onElementChange(element.id, content)}
@@ -138,19 +162,17 @@ export default function ScriptEditor({
       onFocusPrevious={() => focusPrevious(element.id)}
       onFocusNext={() => focusNext(element.id)}
       onStartDualDialogue={onStartDualDialogue}
-      autoContd={autoContd}
       onFocus={() => handleElementFocus(element.id)}
       isDimmed={focusMode && activeElementId !== null && activeElementId !== element.id}
       pendingEdit={pendingEdits?.get(element.id)}
-      onAcceptEdit={() => onAcceptEdit?.(element.id)}
-      onRejectEdit={() => onRejectEdit?.(element.id)}
+      isReviewFocused={reviewElementId === element.id}
     />
   );
 
   const renderGroup = (group: ElementGroup) => {
     if (group.type === 'single') {
       const el = group.elements[0];
-      const index = elements.findIndex(e => e.id === el.id);
+      const index = elementIndexById.get(el.id) ?? -1;
       return renderElement(el, index);
     }
 
@@ -162,13 +184,13 @@ export default function ScriptEditor({
       <div key={group.groupId} className="dual-dialogue-group">
         <div className="dual-dialogue-left">
           {leftElements.map(el => {
-            const index = elements.findIndex(e => e.id === el.id);
+            const index = elementIndexById.get(el.id) ?? -1;
             return renderElement(el, index);
           })}
         </div>
         <div className="dual-dialogue-right">
           {rightElements.map(el => {
-            const index = elements.findIndex(e => e.id === el.id);
+            const index = elementIndexById.get(el.id) ?? -1;
             return renderElement(el, index);
           })}
         </div>

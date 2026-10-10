@@ -1,6 +1,6 @@
 import { Screenplay, ScriptElement, ProjectMeta, ScriptSnapshot } from './types';
 import { v4 as uuidv4 } from 'uuid';
-import { estimatePageCount } from './pdfExport';
+import { estimatePageCount } from './utils/pageEstimate';
 import * as apiClient from './services/apiClient';
 
 const MAX_SNAPSHOTS = 20;
@@ -241,6 +241,7 @@ export async function saveProject(screenplay: Screenplay): Promise<void> {
     updateProjectInList(getProjectMeta(toSave));
   } catch (e) {
     console.error('Failed to save project:', e);
+    throw e;
   }
 }
 
@@ -312,8 +313,8 @@ function migrateLegacyData(): Screenplay | null {
       if (!parsed.createdAt) {
         parsed.createdAt = parsed.updatedAt || Date.now();
       }
-      // Save in new format
-      saveProject(parsed);
+      // Make the migrated copy durable locally before removing the legacy key.
+      saveProjectSync(parsed);
       setCurrentProjectId(parsed.id);
       // Remove legacy data
       localStorage.removeItem(LEGACY_KEY);

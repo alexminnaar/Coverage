@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { executeCommand } from '../services/aiClient';
 import { ScriptElement } from '../types';
+import Dialog from './Dialog';
 
 interface AICommandPaletteProps {
   isOpen: boolean;
@@ -84,24 +85,19 @@ export default function AICommandPalette({
     }
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Escape') {
-      onClose();
-    }
-  };
-
   if (!isOpen) return null;
 
   return (
-    <div className="ai-command-overlay" onClick={onClose}>
-      <div 
-        className="ai-command-palette" 
-        onClick={(e) => e.stopPropagation()}
-        onKeyDown={handleKeyDown}
-      >
+    <Dialog
+      className="ai-command-palette"
+      overlayClassName="ai-command-overlay"
+      ariaLabelledBy="ai-command-title"
+      onClose={onClose}
+    >
+      <div>
         <div className="ai-command-header">
-          <h3>AI Command</h3>
-          <button className="btn btn-xs" onClick={onClose}>×</button>
+          <h3 id="ai-command-title">AI Command</h3>
+          <button className="btn btn-xs" onClick={onClose} aria-label="Close AI command">×</button>
         </div>
 
         {!selectedElement && (
@@ -193,7 +189,7 @@ export default function AICommandPalette({
           </div>
         )}
       </div>
-    </div>
+    </Dialog>
   );
 }
 

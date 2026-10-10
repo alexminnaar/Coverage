@@ -7,6 +7,8 @@ interface BeatColumnProps {
   title: string;
   actIndex: number;
   beats: Beat[];
+  totalBeats: number;
+  beatNumberOffset: number;
   selectedBeatId: string | null;
   onSelectBeat: (id: string) => void;
   onUpdateBeat: (id: string, updates: Partial<Beat>) => void;
@@ -22,6 +24,8 @@ export default function BeatColumn({
   title,
   actIndex,
   beats,
+  totalBeats,
+  beatNumberOffset,
   selectedBeatId,
   onSelectBeat,
   onUpdateBeat,
@@ -101,12 +105,24 @@ export default function BeatColumn({
   };
 
   const sortedBeats = [...beats].sort((a, b) => a.order - b.order);
+  const outlinePercentage = totalBeats > 0
+    ? Math.round((beats.length / totalBeats) * 100)
+    : 0;
 
   return (
     <div className="beat-column">
       <div className="beat-column-header">
-        <h3>{title}</h3>
-        <span className="beat-count">{beats.length}</span>
+        <div className="beat-column-heading">
+          <span>Section {String(actIndex + 1).padStart(2, '0')}</span>
+          <h3>{title}</h3>
+        </div>
+        <div className="beat-column-meta">
+          <strong>{beats.length}</strong>
+          <span>{outlinePercentage}% of outline</span>
+        </div>
+        <div className="beat-column-progress" aria-hidden="true">
+          <span style={{ width: `${outlinePercentage}%` }} />
+        </div>
       </div>
       
       <div
@@ -117,10 +133,11 @@ export default function BeatColumn({
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
       >
-        {sortedBeats.map((beat) => (
+        {sortedBeats.map((beat, index) => (
           <BeatCard
             key={beat.id}
             beat={beat}
+            beatNumber={beatNumberOffset + index + 1}
             isSelected={selectedBeatId === beat.id}
             onSelect={() => onSelectBeat(beat.id)}
             onUpdate={(updates) => onUpdateBeat(beat.id, updates)}

@@ -12,6 +12,7 @@ interface UseHistoryReturn<T> {
   canUndo: boolean;
   canRedo: boolean;
   clearHistory: () => void;
+  resetState: (newState: T) => void;
 }
 
 export function useHistory<T>(
@@ -33,6 +34,7 @@ export function useHistory<T>(
     currentIndexRef.current = 0;
     return initial;
   });
+  const [, setHistoryVersion] = useState(0);
 
   // Wrapper to track if we're in an undo/redo operation
   const isUndoRedoRef = useRef(false);
@@ -48,8 +50,9 @@ export function useHistory<T>(
         return nextState;
       }
 
-      // Deep compare to avoid duplicate history entries for same state
-      if (JSON.stringify(prevState) === JSON.stringify(nextState)) {
+      // State updates in the editor are immutable, so reference equality is
+      // sufficient and avoids serializing an entire screenplay per keystroke.
+      if (Object.is(prevState, nextState)) {
         return prevState;
       }
 
@@ -95,7 +98,16 @@ export function useHistory<T>(
   const clearHistory = useCallback(() => {
     historyRef.current = [state];
     currentIndexRef.current = 0;
+    setHistoryVersion(version => version + 1);
   }, [state]);
+
+  const resetState = useCallback((newState: T) => {
+    historyRef.current = [newState];
+    currentIndexRef.current = 0;
+    isUndoRedoRef.current = false;
+    setStateInternal(newState);
+    setHistoryVersion(version => version + 1);
+  }, []);
 
   return {
     state,
@@ -105,6 +117,7 @@ export function useHistory<T>(
     canUndo: currentIndexRef.current > 0,
     canRedo: currentIndexRef.current < historyRef.current.length - 1,
     clearHistory,
+    resetState,
   };
 }
 

@@ -37,6 +37,7 @@ interface HeaderProps {
   title: string;
   author: string;
   pageCount: number;
+  saveStatus: 'saving' | 'saved' | 'error';
   onTitleChange: (title: string) => void;
   onAuthorChange: (author: string) => void;
   onExportPDF: () => void;
@@ -47,6 +48,7 @@ interface HeaderProps {
   onShowTitlePage: () => void;
   onShowStatistics: () => void;
   onShowBeatBoard: () => void;
+  onShowStoryboard: () => void;
   onShowSnapshots: () => void;
   onUndo: () => void;
   onRedo: () => void;
@@ -93,6 +95,7 @@ export default function Header({
   title,
   author,
   pageCount,
+  saveStatus,
   onTitleChange,
   onAuthorChange,
   onExportPDF,
@@ -103,6 +106,7 @@ export default function Header({
   onShowTitlePage,
   onShowStatistics,
   onShowBeatBoard,
+  onShowStoryboard,
   onShowSnapshots,
   onUndo,
   onRedo,
@@ -175,7 +179,7 @@ export default function Header({
       <div className="header-left">
         <button className="logo" onClick={onShowProjects} title="View all screenplays">
           <Clapperboard size={22} className="logo-icon" />
-          <span className="logo-text">Screenwriter</span>
+          <span className="logo-text">Coverage</span>
         </button>
 
         <div className="header-divider" />
@@ -274,6 +278,10 @@ export default function Header({
                 <LayoutGrid size={18} />
                 <span>Beat Board</span>
               </button>
+              <button onClick={() => { onShowStoryboard(); setShowToolsMenu(false); }}>
+                <Clapperboard size={18} />
+                <span>Scene Storyboard</span>
+              </button>
               <div className="dropdown-divider" />
               {onShowPrintPreview && (
                 <button onClick={() => { onShowPrintPreview(); setShowToolsMenu(false); }}>
@@ -360,13 +368,14 @@ export default function Header({
               placeholder="Untitled Screenplay"
             />
           ) : (
-            <h1 
+            <button
+              type="button"
               className="title-display" 
               onClick={() => setIsEditingTitle(true)}
               title="Click to edit"
             >
               {title || 'Untitled Screenplay'}
-            </h1>
+            </button>
           )}
           
           {isEditingAuthor ? (
@@ -381,14 +390,26 @@ export default function Header({
               placeholder="Your Name"
             />
           ) : (
-            <span 
+            <button
+              type="button"
               className="author-display" 
               onClick={() => setIsEditingAuthor(true)}
               title="Click to edit"
             >
               {author ? `by ${author}` : 'by Anonymous'}
-            </span>
+            </button>
           )}
+          <span
+            className={`save-status save-status--${saveStatus}`}
+            role="status"
+            aria-live="polite"
+          >
+            {saveStatus === 'saving'
+              ? 'Saving…'
+              : saveStatus === 'error'
+                ? 'Save failed — stored copy unavailable'
+                : 'Saved'}
+          </span>
         </div>
       </div>
 
@@ -428,7 +449,7 @@ export default function Header({
         <div className="header-divider" />
         
         <div className="header-actions">
-          {/* Focus Mode Toggles */}
+          {/* Writing view toggles */}
           {(onToggleTypewriterMode || onToggleFocusMode) && (
             <div className="focus-toggle-group">
               {onToggleTypewriterMode && (
@@ -436,6 +457,7 @@ export default function Header({
                   className={`focus-toggle-btn ${typewriterMode ? 'active' : ''}`}
                   onClick={onToggleTypewriterMode}
                   title="Typewriter Mode (⌘⇧T)"
+                  aria-label="Toggle Typewriter Mode"
                 >
                   <AlignCenter size={16} />
                 </button>
@@ -444,7 +466,8 @@ export default function Header({
                 <button
                   className={`focus-toggle-btn ${focusMode ? 'active' : ''}`}
                   onClick={onToggleFocusMode}
-                  title="Focus Mode - Dim unfocused text"
+                  title="Line Focus — dim inactive text (⌘⇧F)"
+                  aria-label="Toggle Line Focus"
                 >
                   <Eye size={16} />
                 </button>
@@ -458,6 +481,7 @@ export default function Header({
               className={`toolbar-btn ai-btn ${showAIChat ? 'active' : ''} ${aiEnabled ? '' : 'disabled'}`}
               onClick={onToggleAIChat}
               title={aiEnabled ? "Toggle AI Chat (⌘/)" : "AI disabled"}
+              aria-label={aiEnabled ? 'Toggle AI chat' : 'AI chat disabled'}
             >
               <Sparkles size={18} />
             </button>
@@ -465,6 +489,7 @@ export default function Header({
               className="toolbar-btn-sm" 
               onClick={onShowAISettings}
               title="AI Settings"
+              aria-label="Open AI settings"
             >
               <Settings size={14} />
             </button>
@@ -475,6 +500,7 @@ export default function Header({
               className={`toolbar-btn ${showNotesPanel ? 'active' : ''}`}
               onClick={onShowNotesPanel}
               title="Script Notes"
+              aria-label="Toggle script notes"
             >
               <MessageSquare size={18} />
             </button>
@@ -486,6 +512,7 @@ export default function Header({
             className="toolbar-btn" 
             onClick={onToggleTheme}
             title={`Theme: ${theme}`}
+            aria-label={`Toggle theme, currently ${theme}`}
           >
             {theme === 'dark' ? <Moon size={18} /> : <Sun size={18} />}
           </button>
@@ -493,7 +520,8 @@ export default function Header({
           <button 
             className="toolbar-btn" 
             onClick={onToggleDistractionFree}
-            title="Focus mode (F11)"
+            title="Distraction-free mode (F11)"
+            aria-label="Toggle distraction-free mode"
           >
             {distractionFree ? <Minimize size={18} /> : <Maximize size={18} />}
           </button>
@@ -501,7 +529,8 @@ export default function Header({
           <button 
             className="toolbar-btn" 
             onClick={onShowHelp}
-            title="Help (?)"
+            title="Help (F1)"
+            aria-label="Open help"
           >
             <HelpCircle size={18} />
           </button>

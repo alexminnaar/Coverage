@@ -99,6 +99,9 @@ export interface Screenplay {
   // Beat board
   beats?: Beat[];
   beatStructure?: BeatStructure;
+  treatment?: string;
+  // Scene storyboards, keyed by the scene-heading element ID
+  storyboards?: Record<string, SceneStoryboard>;
   // Scene numbering
   sceneNumberingEnabled?: boolean;
   scenesLocked?: boolean;
@@ -127,6 +130,40 @@ export interface Beat {
   actIndex: number; // 0-2 for 3-act, 0-3 for 4-act, etc.
   order: number; // position within act
   linkedSceneId?: string; // optional link to scene
+}
+
+export type StoryboardAspectRatio = '2.39:1' | '16:9' | '4:3' | '1:1' | '9:16';
+export type StoryboardImageStatus = 'idle' | 'queued' | 'generating' | 'complete' | 'failed';
+
+export interface StoryboardImage {
+  status: StoryboardImageStatus;
+  url?: string;
+  providerAssetId?: string;
+  error?: string;
+  createdAt?: number;
+}
+
+export interface StoryboardShot {
+  id: string;
+  order: number;
+  title: string;
+  shotType: string;
+  cameraAngle?: string;
+  action: string;
+  characters: string[];
+  dialogue?: string;
+  continuityNotes?: string;
+  imagePrompt?: string;
+  image?: StoryboardImage;
+}
+
+export interface SceneStoryboard {
+  sceneId: string;
+  style: string;
+  aspectRatio: StoryboardAspectRatio;
+  shots: StoryboardShot[];
+  createdAt: number;
+  updatedAt: number;
 }
 
 export const BEAT_COLORS = [

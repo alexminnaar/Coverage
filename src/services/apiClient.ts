@@ -18,7 +18,9 @@ function resolveApiUrl(path: string): string {
 export async function checkAPIAvailability(): Promise<boolean> {
   try {
     const response = await fetch(resolveApiUrl('/health'));
-    return response.ok;
+    if (!response.ok) return false;
+    const health = await response.json() as { database_connected?: boolean };
+    return health.database_connected === true;
   } catch {
     return false;
   }

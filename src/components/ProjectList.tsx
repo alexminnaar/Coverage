@@ -1,4 +1,5 @@
 import { ProjectMeta } from '../types';
+import Dialog from './Dialog';
 
 interface ProjectListProps {
   isOpen: boolean;
@@ -43,11 +44,14 @@ export default function ProjectList({
   if (!isOpen) return null;
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal-content project-list-modal" onClick={(e) => e.stopPropagation()}>
+    <Dialog
+      className="modal-content project-list-modal"
+      ariaLabelledBy="project-list-title"
+      onClose={onClose}
+    >
         <div className="modal-header">
-          <h2>Your Screenplays</h2>
-          <button className="modal-close" onClick={onClose}>×</button>
+          <h2 id="project-list-title">Your Screenplays</h2>
+          <button className="modal-close" onClick={onClose} aria-label="Close screenplays">×</button>
         </div>
         
         <div className="modal-body">
@@ -68,6 +72,14 @@ export default function ProjectList({
                   key={project.id}
                   className={`project-card ${project.id === currentProjectId ? 'active' : ''}`}
                   onClick={() => onSelectProject(project.id)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault();
+                      onSelectProject(project.id);
+                    }
+                  }}
+                  role="button"
+                  tabIndex={0}
                 >
                   <div className="project-card-header">
                     <h3 className="project-title">{project.title || 'Untitled'}</h3>
@@ -78,6 +90,7 @@ export default function ProjectList({
                         onDeleteProject(project.id);
                       }}
                       title="Delete screenplay"
+                      aria-label={`Delete ${project.title || 'Untitled'}`}
                     >
                       ×
                     </button>
@@ -97,8 +110,7 @@ export default function ProjectList({
             )}
           </div>
         </div>
-      </div>
-    </div>
+    </Dialog>
   );
 }
 

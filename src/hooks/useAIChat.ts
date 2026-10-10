@@ -1,5 +1,6 @@
 import { useMemo, useState, useCallback, useRef } from 'react';
-import { streamChat, ChatMessage, EditProposal, AIStreamEvent, BeatOp } from '../services/aiClient';
+import { streamChat, ChatMessage, EditProposal, AIStreamEvent, BeatOp, StoryboardOp } from '../services/aiClient';
+import type { AIChatMode } from '../services/aiClient';
 import { ElementType } from '../types';
 import { buildGlobalIndex } from '../utils/globalIndex';
 
@@ -10,7 +11,7 @@ interface UseAIChatResult {
   sendMessage: (
     content: string,
     sceneContext?: string,
-    mode?: 'ask' | 'edit',
+    mode?: AIChatMode,
     requestMeta?: {
       selectedElementId?: string | null;
       selectedText?: string | null;
@@ -46,7 +47,7 @@ function parseEditProposals(
         finalEvent = event;
         break;
       }
-    } catch (e) {
+    } catch {
       // Not valid JSON, continue
       continue;
     }
@@ -87,7 +88,7 @@ function parseEditProposals(
 
         return processedEdits;
       }
-    } catch (e) {
+    } catch {
       // Fallthrough to other parsing methods if JSON fails
       // Fallthrough to other parsing methods if JSON fails
     }
@@ -132,7 +133,8 @@ function parseEditProposals(
 
 export function useAIChat(
   elements?: Array<{ id: string; type: ElementType; content: string }>,
-  projectId?: string
+  projectId?: string,
+  fullScreenplayContext?: string
 ): UseAIChatResult {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
@@ -140,10 +142,11 @@ export function useAIChat(
   const abortControllerRef = useRef<AbortController | null>(null);
 
   const globalIndex = useMemo(() => {
+    if (fullScreenplayContext) return fullScreenplayContext;
     if (!elements || elements.length === 0) return undefined;
-    // Best-effort: build a compact index for query rewriting/reranking/verification.
+    // Backward-compatible fallback for callers without a full screenplay snapshot.
     return buildGlobalIndex(elements as any);
-  }, [elements]);
+  }, [elements, fullScreenplayContext]);
 
   const stopStreaming = useCallback(() => {
     if (abortControllerRef.current) {
@@ -156,7 +159,7 @@ export function useAIChat(
   const sendMessage = useCallback(async (
     content: string,
     sceneContext?: string,
-    mode: 'ask' | 'edit' = 'ask',
+    mode: AIChatMode = 'ask',
     requestMeta?: {
       selectedElementId?: string | null;
       selectedText?: string | null;
@@ -183,7 +186,7 @@ export function useAIChat(
     setMessages(prev => {
       return [
         ...prev,
-        { role: 'assistant', content: '', events: (mode === 'edit' || mode === 'ask') ? [] : undefined }
+        { role: 'assistant', content: '', events: [] }
       ];
     });
 
@@ -192,8 +195,8 @@ export function useAIChat(
       const allMessages = [...messages, userMessage];
 
       let finalEdits: EditProposal[] | undefined = undefined;
-      let finalBeatOps: BeatOp[] | undefined = undefined;
-      let typedEvents: AIStreamEvent[] = [];
+      const finalResult: { beatOps?: BeatOp[]; storyboardOps?: StoryboardOp[] } = {};
+      const typedEvents: AIStreamEvent[] = [];
 
       const handleStreamEvent = (event: AIStreamEvent) => {
         typedEvents.push(event);
@@ -240,7 +243,29 @@ export function useAIChat(
         if (event.type === 'final' && (event as any).beatOps) {
           const beatPayload = (event as any).beatOps;
           if (beatPayload.ops && Array.isArray(beatPayload.ops)) {
-            finalBeatOps = beatPayload.ops;
+            finalResult.beatOps = beatPayload.ops;
+          }
+          return;
+        }
+
+        if (event.type === 'outline_ops_ready') {
+          const beatPayload = event.beatOps;
+          if (beatPayload.ops && Array.isArray(beatPayload.ops)) {
+            finalResult.beatOps = beatPayload.ops;
+          }
+          return;
+        }
+
+        if (event.type === 'final' && event.storyboardOps) {
+          if (Array.isArray(event.storyboardOps.ops)) {
+            finalResult.storyboardOps = event.storyboardOps.ops;
+          }
+          return;
+        }
+
+        if (event.type === 'storyboard_ops_ready') {
+          if (Array.isArray(event.storyboardOps.ops)) {
+            finalResult.storyboardOps = event.storyboardOps.ops;
           }
           return;
         }
@@ -303,11 +328,21 @@ export function useAIChat(
               ...lastMsg,
               content: fullResponse,
               edits: edits.length > 0 ? edits : undefined,
-              beatOps: finalBeatOps?.length ? finalBeatOps : undefined,
+              beatOps: finalResult.beatOps?.length ? finalResult.beatOps : undefined,
+              storyboardOps: finalResult.storyboardOps?.length ? finalResult.storyboardOps : undefined,
               events: typedEvents
             };
           } else {
-            updated[updated.length - 1] = { ...(lastMsg as any), role: 'assistant', content: fullResponse, events: typedEvents };
+            updated[updated.length - 1] = {
+              ...lastMsg,
+              role: 'assistant',
+              content: fullResponse,
+              beatOps: finalResult.beatOps?.length ? finalResult.beatOps : lastMsg.beatOps,
+              storyboardOps: finalResult.storyboardOps?.length
+                ? finalResult.storyboardOps
+                : lastMsg.storyboardOps,
+              events: typedEvents,
+            };
           }
           return updated;
         });
@@ -323,10 +358,39 @@ export function useAIChat(
             updated[updated.length - 1] = {
               ...lastMsg,
               edits: edits.length > 0 ? edits : lastMsg.edits,
-              beatOps: finalBeatOps?.length ? finalBeatOps : lastMsg.beatOps,
+              beatOps: finalResult.beatOps?.length ? finalResult.beatOps : lastMsg.beatOps,
+              storyboardOps: finalResult.storyboardOps?.length
+                ? finalResult.storyboardOps
+                : lastMsg.storyboardOps,
               events: typedEvents.length > 0 ? typedEvents : lastMsg.events
             };
           }
+          return updated;
+        });
+      }
+
+      if (finalResult.beatOps?.length) {
+        setMessages(prev => {
+          const updated = [...prev];
+          const lastMsg = updated[updated.length - 1];
+          updated[updated.length - 1] = {
+            ...lastMsg,
+            beatOps: finalResult.beatOps,
+            events: typedEvents.length > 0 ? typedEvents : lastMsg.events,
+          };
+          return updated;
+        });
+      }
+
+      if (finalResult.storyboardOps?.length) {
+        setMessages(prev => {
+          const updated = [...prev];
+          const lastMsg = updated[updated.length - 1];
+          updated[updated.length - 1] = {
+            ...lastMsg,
+            storyboardOps: finalResult.storyboardOps,
+            events: typedEvents.length > 0 ? typedEvents : lastMsg.events,
+          };
           return updated;
         });
       }
@@ -341,7 +405,7 @@ export function useAIChat(
       setIsStreaming(false);
       abortControllerRef.current = null;
     }
-  }, [messages, elements, projectId]);
+  }, [messages, elements, projectId, globalIndex]);
 
   const clearMessages = useCallback(() => {
     stopStreaming();

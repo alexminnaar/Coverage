@@ -87,11 +87,17 @@ export default function PrintPreview({ isOpen, onClose, screenplay }: PrintPrevi
     });
   }, [pages.length, scrollToPage]);
 
-  const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
+  const handleKeyDown = useCallback((e: KeyboardEvent) => {
     if (e.key === 'ArrowLeft') goToPreviousPage();
     if (e.key === 'ArrowRight') goToNextPage();
     if (e.key === 'Escape') onClose();
   }, [goToPreviousPage, goToNextPage, onClose]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [isOpen, handleKeyDown]);
 
   const handlePrint = useCallback(() => {
     window.print();
@@ -200,7 +206,7 @@ export default function PrintPreview({ isOpen, onClose, screenplay }: PrintPrevi
   if (!isOpen) return null;
 
   return (
-    <div className="print-preview-overlay" onKeyDown={handleKeyDown} tabIndex={0}>
+    <div className="print-preview-overlay">
       {/* Toolbar */}
       <div className="print-preview-toolbar">
         <div className="toolbar-left">
@@ -215,6 +221,7 @@ export default function PrintPreview({ isOpen, onClose, screenplay }: PrintPrevi
             className="toolbar-btn" 
             onClick={goToPreviousPage}
             disabled={currentPageIndex === 0}
+            aria-label="Previous page"
           >
             <ChevronLeft size={20} />
           </button>
@@ -225,6 +232,7 @@ export default function PrintPreview({ isOpen, onClose, screenplay }: PrintPrevi
             className="toolbar-btn"
             onClick={goToNextPage}
             disabled={currentPageIndex === pages.length - 1}
+            aria-label="Next page"
           >
             <ChevronRight size={20} />
           </button>
@@ -255,6 +263,17 @@ export default function PrintPreview({ isOpen, onClose, screenplay }: PrintPrevi
               setCurrentPageIndex(idx);
               scrollToPage(idx);
             }}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                setCurrentPageIndex(idx);
+                scrollToPage(idx);
+              }
+            }}
+            role="button"
+            aria-current={idx === currentPageIndex ? 'page' : undefined}
+            aria-label={page.kind === 'title' ? 'Show title page' : `Show page ${page.page.pageNumber}`}
+            tabIndex={0}
           >
             <div className="thumbnail-content">
               <span>{page.kind === 'title' ? 'T' : page.page.pageNumber}</span>

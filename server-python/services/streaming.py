@@ -64,6 +64,14 @@ def format_buffer_item(buffer_item: Any, stream_events: bool) -> Optional[str]:
             return format_status_text(f"[Todo] {label}: {status}")
         return None
 
+    if evt_type == "tool_call":
+        tool_name = str(buffer_item.get("tool") or "unknown")
+        return format_status_text(TOOL_STATUS_START.get(tool_name, f"[Tool] Running {tool_name}"))
+
+    if evt_type == "tool_result":
+        tool_name = str(buffer_item.get("tool") or "unknown")
+        return format_status_text(TOOL_STATUS_DONE.get(tool_name, f"[Tool] Finished {tool_name}"))
+
     if evt_type == "apply_started":
         label = buffer_item.get("label") or "Applying edits"
         element_ids = buffer_item.get("elementIds") or []
@@ -85,15 +93,18 @@ def format_final_payload(
     *,
     applied_edits: Optional[Dict[str, Any]] = None,
     beat_ops: Optional[List[Dict[str, Any]]] = None,
+    shot_ops: Optional[List[Dict[str, Any]]] = None,
     content: Optional[str] = None,
 ) -> str:
-    """Format final payload for chat output (edits, beat ops, and/or text)."""
+    """Format final payload for chat output (edits, staged ops, and/or text)."""
     if stream_events:
         payload: Dict[str, Any] = {"type": "final"}
         if applied_edits:
             payload["edits"] = applied_edits
         if beat_ops:
             payload["beatOps"] = {"ops": beat_ops}
+        if shot_ops:
+            payload["storyboardOps"] = {"ops": shot_ops}
         if content:
             payload["content"] = content
         return json.dumps(payload)
@@ -103,6 +114,8 @@ def format_final_payload(
         legacy.update(applied_edits)
     if beat_ops:
         legacy["ops"] = beat_ops
+    if shot_ops:
+        legacy["storyboardOps"] = {"ops": shot_ops}
     if content and not legacy:
         return content
     return json.dumps(legacy)
@@ -121,6 +134,7 @@ TOOL_STATUS_START: Dict[str, str] = {
     "submit_edits": "[Editing] Submitting edits",
     "verify_edits": "[Verifying] Checking edits",
     "manage_beats": "[Beats] Processing beat operations",
+    "manage_shots": "[Storyboard] Processing shot operations",
     "count_elements": "[Counting] Querying element counts",
 }
 
@@ -135,6 +149,7 @@ TOOL_STATUS_DONE: Dict[str, str] = {
     "submit_edits": "[Editing] Edits submitted",
     "verify_edits": "[Verifying] Verification complete",
     "manage_beats": "[Beats] Operations complete",
+    "manage_shots": "[Storyboard] Operations complete",
     "count_elements": "[Counting] Done",
 }
 
@@ -200,21 +215,6 @@ async def _emit_plan_updated(plan: Any, emit: EmitFn) -> None:
     if not payload:
         return
     await emit({"type": "plan_updated", "plan": payload})
-    # Legacy checklist events for older clients.
-    todos = payload.get("todos") or []
-    if isinstance(todos, list) and todos:
-        await emit({
-            "type": "plan_todos",
-            "todos": [
-                {
-                    "id": str(t.get("id", "")),
-                    "label": str(t.get("title") or t.get("label") or ""),
-                    "status": str(t.get("status", "pending")),
-                }
-                for t in todos
-                if isinstance(t, dict) and t.get("id")
-            ],
-        })
 
 
 async def run_unified_agent_streaming(
@@ -237,6 +237,7 @@ async def run_unified_agent_streaming(
     _pending_tools: Dict[str, str] = {}
     _tool_call_count = 0
     _streamed_text_deltas = False
+    _completed_after_staged_proposal = False
     result: Any = None
 
     try:
@@ -290,9 +291,6 @@ async def run_unified_agent_streaming(
                                     "label": "Applying edits",
                                 })
 
-                            if tool_name in TOOL_STATUS_START:
-                                await emit({"type": "status", "message": TOOL_STATUS_START[tool_name]})
-
                         elif item_type == "tool_call_output_item":
                             tool_call_id = _tool_call_id_from_item(item)
                             tool_name = _pending_tools.pop(tool_call_id, "unknown")
@@ -310,13 +308,36 @@ async def run_unified_agent_streaming(
                             if tool_name == "submit_edits":
                                 await emit({"type": "apply_done"})
 
-                            if tool_name in TOOL_STATUS_DONE:
-                                await emit({"type": "status", "message": TOOL_STATUS_DONE[tool_name]})
-
                             if tool_name == "update_plan":
                                 plan = getattr(context, "_plan", None)
                                 if plan is not None:
                                     await _emit_plan_updated(plan, emit)
+
+                            if tool_name == "manage_beats":
+                                beat_ops = getattr(context, "_beat_ops", None)
+                                if beat_ops:
+                                    await emit({
+                                        "type": "outline_ops_ready",
+                                        "beatOps": {"ops": list(beat_ops)},
+                                    })
+                                    final_output = "Outline changes are ready for review."
+                                    _completed_after_staged_proposal = True
+                                    if result is not None and hasattr(result, "cancel"):
+                                        result.cancel()
+                                    break
+
+                            if tool_name == "manage_shots":
+                                shot_ops = getattr(context, "_shot_ops", None)
+                                if shot_ops:
+                                    await emit({
+                                        "type": "storyboard_ops_ready",
+                                        "storyboardOps": {"ops": list(shot_ops)},
+                                    })
+                                    final_output = "Storyboard changes are ready for review."
+                                    _completed_after_staged_proposal = True
+                                    if result is not None and hasattr(result, "cancel"):
+                                        result.cancel()
+                                    break
 
                         elif item_type == "message_output_item":
                             # Avoid duplicating text already streamed via ResponseTextDeltaEvent.
@@ -342,7 +363,7 @@ async def run_unified_agent_streaming(
             logger.info("[streaming] agent run cancelled")
             raise
 
-        if result is not None:
+        if result is not None and not _completed_after_staged_proposal:
             if result.final_output is not None:
                 final_output = str(result.final_output)
             elif result.is_complete:

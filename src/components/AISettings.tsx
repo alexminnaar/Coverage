@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { checkAIHealth } from '../services/aiClient';
+import Dialog from './Dialog';
 
 interface AISettingsProps {
   isOpen: boolean;
@@ -37,11 +38,14 @@ export default function AISettings({
   if (!isOpen) return null;
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal ai-settings-modal" onClick={(e) => e.stopPropagation()}>
+    <Dialog
+      className="modal ai-settings-modal"
+      ariaLabelledBy="ai-settings-title"
+      onClose={onClose}
+    >
         <div className="modal-header">
-          <h2>AI Settings</h2>
-          <button className="modal-close" onClick={onClose}>×</button>
+          <h2 id="ai-settings-title">AI Settings</h2>
+          <button className="modal-close" onClick={onClose} aria-label="Close AI settings">×</button>
         </div>
 
         <div className="modal-content">
@@ -52,6 +56,7 @@ export default function AISettings({
                 <p>Turn on inline completion, chat, and commands</p>
               </div>
               <label className="toggle-switch">
+                <span className="sr-only">Enable AI features</span>
                 <input
                   type="checkbox"
                   checked={aiEnabled}
@@ -117,8 +122,7 @@ export default function AISettings({
             </div>
           </div>
         </div>
-      </div>
-    </div>
+    </Dialog>
   );
 }
 

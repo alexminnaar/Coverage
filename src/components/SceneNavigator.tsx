@@ -145,7 +145,7 @@ export default function SceneNavigator({
     ];
     
     // Find where to insert (after the target scene's block)
-    let newTargetIndex = withoutDragged.findIndex(el => el.id === targetSceneId);
+    const newTargetIndex = withoutDragged.findIndex(el => el.id === targetSceneId);
     if (newTargetIndex === -1) return;
     
     // If dragging down, insert after target scene block
@@ -237,6 +237,7 @@ export default function SceneNavigator({
                         className={`scene-notes-toggle ${scene.notes || scene.synopsis ? 'has-notes' : ''}`}
                       onClick={() => toggleNotes(scene.id)}
                         title={isExpanded ? 'Hide details' : 'Show details'}
+                        aria-label={`${isExpanded ? 'Hide' : 'Show'} details for ${scene.heading}`}
                     >
                       📝
                     </button>
@@ -244,8 +245,9 @@ export default function SceneNavigator({
                     {isExpanded && (
                       <div className="scene-details-panel">
                         <div className="scene-synopsis-section">
-                          <label className="scene-detail-label">Synopsis</label>
+                          <label className="scene-detail-label" htmlFor={`scene-synopsis-${scene.id}`}>Synopsis</label>
                           <textarea
+                            id={`scene-synopsis-${scene.id}`}
                             className="scene-synopsis-input"
                             placeholder="What happens in this scene?"
                             value={scene.synopsis}
@@ -254,8 +256,9 @@ export default function SceneNavigator({
                           />
                         </div>
                         <div className="scene-notes-section">
-                          <label className="scene-detail-label">Notes</label>
+                          <label className="scene-detail-label" htmlFor={`scene-notes-${scene.id}`}>Notes</label>
                       <textarea
+                        id={`scene-notes-${scene.id}`}
                         className="scene-notes-input"
                         placeholder="Add notes for this scene..."
                         value={scene.notes}

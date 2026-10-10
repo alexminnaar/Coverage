@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import Dialog from './Dialog';
 
 interface TitlePageData {
   title: string;
@@ -40,11 +41,14 @@ export default function TitlePageEditor({
   if (!isOpen) return null;
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal-content title-page-modal" onClick={(e) => e.stopPropagation()}>
+    <Dialog
+      className="modal-content title-page-modal"
+      ariaLabelledBy="title-page-title"
+      onClose={onClose}
+    >
         <div className="modal-header">
-          <h2>Title Page</h2>
-          <button className="modal-close" onClick={onClose}>×</button>
+          <h2 id="title-page-title">Title Page</h2>
+          <button className="modal-close" onClick={onClose} aria-label="Close title page">×</button>
         </div>
         
         <div className="modal-body">
@@ -125,8 +129,7 @@ export default function TitlePageEditor({
             Save
           </button>
         </div>
-      </div>
-    </div>
+    </Dialog>
   );
 }
 

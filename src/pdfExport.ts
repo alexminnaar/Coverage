@@ -148,24 +148,4 @@ function addTitlePage(doc: jsPDF, screenplay: Screenplay): void {
   }
 }
 
-export function estimatePageCount(screenplay: Screenplay): number {
-  // Industry standard: approximately 55 lines per page
-  const LINES_PER_PAGE = 55;
-  
-  let totalLines = 0;
-  
-  for (const element of screenplay.elements) {
-    // Rough estimate: ~60 characters per line
-    const charCount = element.content.length;
-    const lines = Math.max(1, Math.ceil(charCount / 55));
-    totalLines += lines;
-    
-    // Add extra line for scene headings
-    if (element.type === 'scene-heading') {
-      totalLines += 1;
-    }
-  }
-
-  return Math.max(1, Math.ceil(totalLines / LINES_PER_PAGE));
-}
 

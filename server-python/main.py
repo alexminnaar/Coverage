@@ -17,8 +17,11 @@ from models import (
     HealthResponse,
     CommandResponse,
     BeatChatRequest,
+    StoryboardImageRequest,
+    StoryboardImageResponse,
 )
 from services.llm_service import llm_service
+from services.storyboard_image_service import storyboard_image_service
 
 app = FastAPI(title="Screenwriter AI Server", version="1.0.0")
 
@@ -48,6 +51,7 @@ async def root():
             "POST /api/complete - Inline completion (streaming)",
             "POST /api/chat - Chat messages (streaming)",
             "POST /api/beat-chat - Beat AI chat (streaming JSON ops)",
+            "POST /api/storyboard/generate-image - Generate and store one storyboard panel",
             "POST /api/command - Execute rewrite command",
         ]
     }
@@ -74,7 +78,8 @@ async def health():
     return {
         "status": "ok",
         "configured": llm_service.is_configured(),
-        "database_connected": db_connected
+        "database_connected": db_connected,
+        "image_generation_configured": storyboard_image_service.is_configured(),
     }
 
 
@@ -166,6 +171,41 @@ async def stream_chat(request: ChatRequest):
             "Connection": "keep-alive"
         }
     )
+
+
+@app.post("/api/storyboard/generate-image", response_model=StoryboardImageResponse)
+async def generate_storyboard_image(request: StoryboardImageRequest):
+    """Generate one storyboard panel and persist it to R2."""
+    if not storyboard_image_service.is_configured():
+        missing = storyboard_image_service.missing_configuration()
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Storyboard image generation is not configured.",
+                "missing": missing,
+            },
+        )
+
+    try:
+        generated = await storyboard_image_service.generate(
+            project_id=request.projectId,
+            scene_id=request.sceneId,
+            shot_id=request.shotId,
+            prompt=request.prompt,
+            style=request.style,
+            aspect_ratio=request.aspectRatio,
+            previous_provider_asset_id=request.previousProviderAssetId,
+        )
+        return {
+            "url": generated.url,
+            "providerAssetId": generated.provider_asset_id,
+        }
+    except Exception as error:
+        print(f"Storyboard image generation error: {type(error).__name__}: {error}")
+        raise HTTPException(
+            status_code=502,
+            detail="Storyboard image generation failed. Please retry.",
+        ) from error
 
 
 @app.post("/api/beat-chat")

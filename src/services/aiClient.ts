@@ -2,8 +2,9 @@
 
 import { ElementType } from '../types';
 import type { BeatOp } from '../utils/applyBeatOps';
+import type { StoryboardOp } from '../utils/applyStoryboardOps';
 
-const API_BASE = 'http://localhost:3002/api';
+const API_BASE = import.meta.env.VITE_AI_API_BASE_URL || '/ai-api';
 
 export interface CompletionContext {
   elementType: string;
@@ -23,6 +24,8 @@ export interface EditProposal {
 }
 
 export type { BeatOp };
+export type { StoryboardOp };
+export type AIChatMode = 'ask' | 'edit' | 'outline' | 'storyboard';
 
 export type TodoStatus =
   | 'pending'
@@ -48,23 +51,33 @@ export interface PlanState {
 
 export type AIStreamEvent =
   | { type: 'status'; message: string }
+  | { type: 'text_delta'; content: string }
   | { type: 'decision'; action: string; why?: string }
-  | { type: 'tool_call'; tool: string; [key: string]: any }
-  | { type: 'tool_result'; tool: string; [key: string]: any }
+  | { type: 'tool_call'; tool: string; tool_call_id?: string; payload?: string }
+  | { type: 'tool_result'; tool: string; tool_call_id?: string; result_preview?: string; count?: number }
   | { type: 'plan_updated'; plan: PlanState }
   | { type: 'plan_todos'; todos: Array<{ id: string; label: string; status: string }> }
   | { type: 'todo_update'; id: string; status: string; label?: string }
   | { type: 'apply_started'; elementIds: string[]; label?: string }
   | { type: 'apply_done' }
-  | { type: 'final'; edits: { edits: EditProposal[] } }
-  | { type: 'final'; beatOps: { ops: BeatOp[] } }
-  | { type: string; [key: string]: any };
+  | { type: 'outline_ops_ready'; beatOps: { ops: BeatOp[] } }
+  | { type: 'storyboard_ops_ready'; storyboardOps: { ops: StoryboardOp[] } }
+  | { type: 'agent_done'; tool_calls: number; has_output: boolean }
+  | { type: 'error'; error: string }
+  | {
+      type: 'final';
+      content?: string;
+      edits?: { edits: EditProposal[] };
+      beatOps?: { ops: BeatOp[] };
+      storyboardOps?: { ops: StoryboardOp[] };
+    };
 
 export interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
   edits?: EditProposal[]; // Only in edit mode
   beatOps?: BeatOp[];
+  storyboardOps?: StoryboardOp[];
   events?: AIStreamEvent[]; // Typed streaming events (primarily in edit mode)
 }
 
@@ -85,16 +98,88 @@ function getSSEData(frame: string): string | null {
   return dataLines.join('\n');
 }
 
+export function parseAIStreamData(data: string): AIStreamEvent | string {
+  const parsed = JSON.parse(data) as Record<string, unknown>;
+  if (typeof parsed.error === 'string' && parsed.error) {
+    throw new Error(parsed.error);
+  }
+
+  // Backward compatibility with the old envelope:
+  //   {"content":"{\"type\":\"text_delta\",...}"}
+  // Typed events also have a content field, so only unwrap objects that do not
+  // already declare an event type. Otherwise a typed final event is appended
+  // as plain text and duplicates the streamed response.
+  if (typeof parsed.type !== 'string' && typeof parsed.content === 'string') {
+    try {
+      return JSON.parse(parsed.content) as AIStreamEvent;
+    } catch {
+      return parsed.content;
+    }
+  }
+
+  return parsed as AIStreamEvent;
+}
+
 // Check if AI server is available and configured
-export async function checkAIHealth(): Promise<{ available: boolean; configured: boolean }> {
+export async function checkAIHealth(): Promise<{
+  available: boolean;
+  configured: boolean;
+  imageGenerationConfigured?: boolean;
+}> {
   try {
     const response = await fetch(`${API_BASE}/health`);
     if (!response.ok) return { available: false, configured: false };
     const data = await response.json();
-    return { available: true, configured: data.configured };
+    return {
+      available: true,
+      configured: data.configured,
+      imageGenerationConfigured: data.image_generation_configured,
+    };
   } catch {
     return { available: false, configured: false };
   }
+}
+
+export interface StoryboardImageGenerationRequest {
+  projectId: string;
+  sceneId: string;
+  shotId: string;
+  prompt: string;
+  style: string;
+  aspectRatio: '2.39:1' | '16:9' | '4:3' | '1:1' | '9:16';
+  previousProviderAssetId?: string;
+}
+
+export async function generateStoryboardImage(
+  request: StoryboardImageGenerationRequest,
+  signal?: AbortSignal,
+): Promise<{ url: string; providerAssetId: string }> {
+  const response = await fetch(`${API_BASE}/storyboard/generate-image`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request),
+    signal,
+  });
+
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    const detail = payload?.detail;
+    const message = typeof detail === 'string'
+      ? detail
+      : typeof detail?.message === 'string'
+        ? detail.message
+        : Array.isArray(detail)
+          ? detail
+              .map(item => {
+                const field = Array.isArray(item?.loc) ? item.loc[item.loc.length - 1] : 'request';
+                return `${field}: ${item?.msg || 'invalid value'}`;
+              })
+              .join('; ')
+        : 'Failed to generate storyboard panel.';
+    throw new Error(message);
+  }
+
+  return response.json();
 }
 
 // Stream inline completion
@@ -149,7 +234,7 @@ export async function* streamCompletion(
 export async function* streamChat(
   messages: ChatMessage[],
   sceneContext?: string,
-  mode?: 'ask' | 'edit',
+  mode?: AIChatMode,
   projectId?: string,
   signal?: AbortSignal,
   requestMeta?: {
@@ -196,11 +281,18 @@ export async function* streamChat(
 
   while (true) {
     const { done, value } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
+    if (value) {
+      buffer += decoder.decode(value, { stream: !done });
+    }
+    if (done) {
+      buffer += decoder.decode();
+    }
     const frames = buffer.split(/\r?\n\r?\n/);
     buffer = frames.pop() || '';
+    if (done && buffer.trim()) {
+      frames.push(buffer);
+      buffer = '';
+    }
 
     for (const frame of frames) {
       const data = getSSEData(frame);
@@ -208,26 +300,16 @@ export async function* streamChat(
       if (data === '[DONE]') return;
 
       try {
-        const parsed = JSON.parse(data);
-        if (parsed.error) throw new Error(parsed.error);
-
-        // Backward compatibility with the old chat envelope:
-        //   data: {"content":"{\"type\":\"text_delta\",...}"}
-        if (typeof parsed.content === 'string') {
-          try {
-            yield JSON.parse(parsed.content) as AIStreamEvent;
-          } catch {
-            yield parsed.content;
-          }
-          continue;
-        }
-
-        yield parsed as AIStreamEvent;
+        yield parseAIStreamData(data);
       } catch (e) {
-        if (e instanceof SyntaxError) continue;
+        if (e instanceof SyntaxError) {
+          throw new Error(`Received an invalid AI stream event: ${data.slice(0, 160)}`);
+        }
         throw e;
       }
     }
+
+    if (done) break;
   }
 }
 

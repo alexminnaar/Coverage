@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Screenplay, Revision, RevisionColor, REVISION_COLORS } from '../types';
 import { Plus, Check, X, Clock, FileText, ArrowRight } from 'lucide-react';
 import { v4 as uuidv4 } from 'uuid';
+import Dialog from './Dialog';
 
 interface RevisionManagerProps {
   screenplay: Screenplay;
@@ -69,12 +70,15 @@ export default function RevisionManager({
   };
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal-content revision-manager-modal" onClick={e => e.stopPropagation()}>
+    <Dialog
+      className="modal-content revision-manager-modal"
+      ariaLabelledBy="revision-manager-title"
+      onClose={onClose}
+    >
         <div className="modal-header">
           <div className="revision-header-title">
             <FileText size={20} />
-            <h2>Revisions</h2>
+            <h2 id="revision-manager-title">Revisions</h2>
             {currentRevisionId && (
               <span 
                 className="current-revision-badge"
@@ -84,7 +88,7 @@ export default function RevisionManager({
               </span>
             )}
           </div>
-          <button className="modal-close" onClick={onClose}>
+          <button className="modal-close" onClick={onClose} aria-label="Close revisions">
             <X size={20} />
           </button>
         </div>
@@ -94,7 +98,7 @@ export default function RevisionManager({
           {showNewRevision ? (
             <div className="new-revision-form">
               <div className="form-group">
-                <label>Revision Color</label>
+                <span className="form-label">Revision Color</span>
                 <div className="revision-color-grid">
                   {REVISION_COLORS.map(color => (
                     <button
@@ -110,8 +114,9 @@ export default function RevisionManager({
                 </div>
               </div>
               <div className="form-group">
-                <label>Description</label>
+                <label htmlFor="revision-description">Description</label>
                 <input
+                  id="revision-description"
                   type="text"
                   value={newDescription}
                   onChange={(e) => setNewDescription(e.target.value)}
@@ -166,6 +171,15 @@ export default function RevisionManager({
             <div 
               className={`revision-item ${!currentRevisionId ? 'active' : ''} ${compareMode && !compareFrom ? 'compare-selectable' : ''}`}
               onClick={() => !compareMode && onSetActiveRevision(null)}
+              onKeyDown={(event) => {
+                if (!compareMode && (event.key === 'Enter' || event.key === ' ')) {
+                  event.preventDefault();
+                  onSetActiveRevision(null);
+                }
+              }}
+              role="button"
+              tabIndex={0}
+              aria-pressed={!currentRevisionId}
             >
               <div className="revision-color-indicator" style={{ background: '#ffffff', border: '1px solid #ddd' }} />
               <div className="revision-info">
@@ -182,6 +196,15 @@ export default function RevisionManager({
                 key={revision.id}
                 className={`revision-item ${currentRevisionId === revision.id ? 'active' : ''} ${compareMode ? 'compare-selectable' : ''} ${compareFrom === revision.id ? 'compare-selected' : ''}`}
                 onClick={() => handleRevisionClick(revision.id)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    handleRevisionClick(revision.id);
+                  }
+                }}
+                role="button"
+                tabIndex={0}
+                aria-pressed={currentRevisionId === revision.id || compareFrom === revision.id}
               >
                 <div 
                   className="revision-color-indicator" 
@@ -212,8 +235,7 @@ export default function RevisionManager({
         <div className="modal-footer">
           <span>Changes made while a revision is active will be marked with that revision's color.</span>
         </div>
-      </div>
-    </div>
+    </Dialog>
   );
 }
 

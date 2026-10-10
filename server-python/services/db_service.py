@@ -514,8 +514,8 @@ class DBService:
         """Verify that element IDs exist in the screenplay."""
         await self.ensure_pool()
         if not self.pool:
-            logger.info("[DB Verify] No database pool available, assuming all IDs valid")
-            return {eid: True for eid in element_ids}
+            logger.warning("[DB Verify] No database pool available; rejecting unverified IDs")
+            return {eid: False for eid in element_ids}
 
         try:
             query = """
@@ -541,7 +541,7 @@ class DBService:
             return verified
         except Exception as e:
             logger.error(f"[DB Verify] ❌ Error verifying element IDs: {type(e).__name__}: {e}")
-            return {eid: True for eid in element_ids}
+            return {eid: False for eid in element_ids}
 
     async def fetch_project_elements_with_index(
         self,

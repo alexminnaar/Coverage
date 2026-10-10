@@ -1,9 +1,10 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
-import { ScriptElement, ElementType } from '../types';
-import { getCharacterNames, findCharacterMatch, extractLocations } from '../utils/characterUtils';
+import { ElementType } from '../types';
+import { findCharacterMatch } from '../utils/characterUtils';
 
 interface UseCharacterSuggestionProps {
-  elements: ScriptElement[];
+  characters: string[];
+  locations: string[];
   currentContent: string;
   currentType: ElementType;
   isActive: boolean;
@@ -17,18 +18,13 @@ interface UseCharacterSuggestionReturn {
 }
 
 export function useCharacterSuggestion({
-  elements,
+  characters,
+  locations,
   currentContent,
   currentType,
   isActive,
 }: UseCharacterSuggestionProps): UseCharacterSuggestionReturn {
   const [dismissed, setDismissed] = useState(false);
-
-  // Extract all known characters from the script
-  const characters = useMemo(() => getCharacterNames(elements), [elements]);
-  
-  // Extract all known locations from the script
-  const locations = useMemo(() => extractLocations(elements), [elements]);
 
   // Reset dismissed state when content changes
   useEffect(() => {

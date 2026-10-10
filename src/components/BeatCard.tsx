@@ -4,6 +4,7 @@ import { Beat, BEAT_COLORS } from '../types';
 
 interface BeatCardProps {
   beat: Beat;
+  beatNumber: number;
   isSelected: boolean;
   onSelect: () => void;
   onUpdate: (updates: Partial<Beat>) => void;
@@ -15,6 +16,7 @@ interface BeatCardProps {
 
 export default function BeatCard({
   beat,
+  beatNumber,
   isSelected,
   onSelect,
   onUpdate,
@@ -76,6 +78,9 @@ export default function BeatCard({
       onClick={onSelect}
       onDoubleClick={() => setIsEditing(true)}
       onKeyDown={handleCardKeyDown}
+      role="button"
+      aria-pressed={isSelected}
+      aria-label={`Beat ${beatNumber}: ${beat.title || 'Untitled beat'}`}
       tabIndex={0}
       draggable={!isEditing}
       onDragStart={onDragStart}
@@ -84,14 +89,18 @@ export default function BeatCard({
       {beat.color && <div className="beat-color-tag" />}
       
       <div className="beat-card-header">
-        <div className="beat-drag-handle">
-          <GripVertical size={14} />
+        <div className="beat-card-identity">
+          <div className="beat-drag-handle" aria-hidden="true">
+            <GripVertical size={13} />
+          </div>
+          <span className="beat-number">{String(beatNumber).padStart(2, '0')}</span>
         </div>
         <div className="beat-actions">
           <button 
             className="beat-action-btn"
             onClick={(e) => { e.stopPropagation(); setShowColorPicker(!showColorPicker); }}
             title="Set color"
+            aria-label="Set beat color"
           >
             <Palette size={12} />
           </button>
@@ -99,6 +108,7 @@ export default function BeatCard({
             className="beat-action-btn beat-delete-btn"
             onClick={(e) => { e.stopPropagation(); onDelete(); }}
             title="Delete beat"
+            aria-label="Delete beat"
           >
             <X size={12} />
           </button>
@@ -106,21 +116,29 @@ export default function BeatCard({
       </div>
 
       {showColorPicker && (
-        <div className="beat-color-picker" onClick={(e) => e.stopPropagation()}>
+        <div className="beat-color-picker">
           {BEAT_COLORS.map((c) => (
             <button
               key={c.value}
               className={`color-swatch ${beat.color === c.value ? 'active' : ''}`}
               style={{ backgroundColor: c.value }}
-              onClick={() => handleColorSelect(c.value)}
+              onClick={(event) => {
+                event.stopPropagation();
+                handleColorSelect(c.value);
+              }}
               title={c.name}
+              aria-label={`Set color to ${c.name}`}
             />
           ))}
           {beat.color && (
             <button
               className="color-swatch clear"
-              onClick={() => handleColorSelect('')}
+              onClick={(event) => {
+                event.stopPropagation();
+                handleColorSelect('');
+              }}
               title="Clear color"
+              aria-label="Clear beat color"
             >
               <X size={10} />
             </button>

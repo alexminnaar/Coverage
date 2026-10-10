@@ -2,6 +2,7 @@ import { useState, useCallback, useMemo } from 'react';
 import { X, Target } from 'lucide-react';
 import { WritingGoal, WritingSession, GoalType, GoalPeriod } from '../types';
 import { getGoalTypeLabel, getTodayString } from '../utils/writingStats';
+import Dialog from './Dialog';
 
 interface WritingGoalsProps {
   isOpen: boolean;
@@ -70,17 +71,17 @@ export default function WritingGoals({
   const goalMet = progressPercentage >= 100;
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div 
-        className="modal writing-goals-modal" 
-        onClick={e => e.stopPropagation()}
-      >
+    <Dialog
+      className="modal writing-goals-modal"
+      ariaLabelledBy="writing-goals-title"
+      onClose={onClose}
+    >
         <div className="modal-header">
-          <h2>
+          <h2 id="writing-goals-title">
             <Target size={20} />
             Writing Goals
           </h2>
-          <button className="modal-close" onClick={onClose}>
+          <button className="modal-close" onClick={onClose} aria-label="Close writing goals">
             <X size={20} />
           </button>
         </div>
@@ -90,7 +91,7 @@ export default function WritingGoals({
           <div className="goals-section">
             <h4>Set Your Goal</h4>
             <div className="goal-input-group">
-              <label>Write</label>
+              <span className="form-label">Write</span>
               <input
                 type="number"
                 min="1"
@@ -192,8 +193,7 @@ export default function WritingGoals({
             Save Goal
           </button>
         </div>
-      </div>
-    </div>
+    </Dialog>
   );
 }
 
